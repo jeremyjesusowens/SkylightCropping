@@ -5,7 +5,4 @@ dist/
 build/
 .env
 
-# Personal test photos for prompt_eval.py — keep these local, not in git.
-test_photos/*
-!test_photos/README.md
 eval_out/

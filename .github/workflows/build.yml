@@ -73,7 +73,7 @@ jobs:
           --name SkylightCropping app.py
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: SkylightCropping-windows
           path: dist/SkylightCropping.exe
@@ -100,7 +100,7 @@ jobs:
           --name SkylightCropping app.py
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: SkylightCropping-mac
           path: dist/SkylightCropping

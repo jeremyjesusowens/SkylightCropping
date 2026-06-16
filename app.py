@@ -89,6 +89,7 @@ SEL       = "#1d2030"   # selected row
 HOVER     = "#191b2a"   # subtle hover
 
 PREVIEW_MAX_PX = 1600    # cap for the in-app preview copy (display only)
+THUMB_SIZE = (58, 34)    # queue-row thumbnail size
 
 _SUBJECT_EMOJI: dict[str, str] = {
     "heron": "🦤", "egret": "🦤", "crane": "🦢", "eagle": "🦅", "hawk": "🦅",
@@ -113,6 +114,18 @@ def subject_emoji(subject: str) -> str:
     return "📷"
 
 
+def make_thumbnail(path: str, size: tuple[int, int] = THUMB_SIZE) -> Image.Image:
+    """Load an image file and return a small, fully-decoded RGB thumbnail.
+
+    Raises on unreadable/corrupt files — callers decide how to handle that.
+    """
+    with Image.open(path) as im:
+        im = ImageOps.exif_transpose(im).convert("RGB")
+        im = ImageOps.fit(im, size, Image.LANCZOS)
+        im.load()  # fully decode before the file handle closes
+    return im
+
+
 def load_settings() -> dict:
     defaults = {
         "api_key": "",
@@ -121,8 +134,8 @@ def load_settings() -> dict:
         "to_email": DEFAULT_TO,
         "smtp_host": "smtp.mail.yahoo.com",
         "smtp_port": "587",
-        "max_retries": "3",
-        "retry_delay": "90",
+        "max_retries": "12",
+        "retry_delay": "300",
         "model": "claude-opus-4-7",
         "output_suffix": "_16x9",
         # remembered between sessions
@@ -198,6 +211,12 @@ class App(ctk.CTk):
         # Trebuchet MS ships with Windows; Helvetica Neue is the macOS fallback.
         UI     = "Helvetica Neue" if sys.platform == "darwin" else "Trebuchet MS"
         MONO_F = "Menlo"          if sys.platform == "darwin" else "Courier New"
+        # A color-emoji font, so subject icons render in their native colors
+        # instead of being substituted by a fallback glyph tinted by the
+        # surrounding label's text_color.
+        EMOJI_F = ("Apple Color Emoji" if sys.platform == "darwin"
+                   else "Segoe UI Emoji" if sys.platform == "win32"
+                   else "Noto Color Emoji")
         self.f_word    = ctk.CTkFont(family=UI,     size=20, weight="bold")
         self.f_word_it = ctk.CTkFont(family=UI,     size=20, slant="italic")
         self.f_nav     = ctk.CTkFont(family=UI,     size=13, weight="bold")
@@ -207,6 +226,7 @@ class App(ctk.CTk):
         self.f_small   = ctk.CTkFont(family=UI,     size=11)
         self.f_button  = ctk.CTkFont(family=UI,     size=13, weight="bold")
         self.f_mono    = ctk.CTkFont(family=MONO_F, size=12)
+        self.f_emoji   = ctk.CTkFont(family=EMOJI_F, size=12)
 
         self._build_ui()
 
@@ -546,17 +566,20 @@ class App(ctk.CTk):
         status = ctk.CTkLabel(row, text="● queued", font=self.f_small,
                               text_color=DIM, anchor="w")
         status.place(x=80, y=26)
+        subject_emoji_lbl = ctk.CTkLabel(row, text="", font=self.f_emoji, anchor="w")
+        subject_emoji_lbl.place(x=80, y=48)
         subject_lbl = ctk.CTkLabel(row, text="", font=self.f_small,
                                    text_color=DIM, anchor="w")
-        subject_lbl.place(x=80, y=48)
+        subject_lbl.place(x=98, y=48)
         size_lbl = ctk.CTkLabel(row, text="", font=self.f_small,
                                 text_color=DIM, anchor="e")
         size_lbl.place(relx=1.0, x=-10, y=10, anchor="ne")
 
         item = {"path": path, "status": "queued", "result": None, "row": row,
                 "thumb": thumb, "name": name, "status_lbl": status,
-                "subject_lbl": subject_lbl, "size_lbl": size_lbl, "thumb_img": None}
-        for w in (row, thumb, name, status, subject_lbl, size_lbl):
+                "subject_emoji_lbl": subject_emoji_lbl, "subject_lbl": subject_lbl,
+                "size_lbl": size_lbl, "thumb_img": None}
+        for w in (row, thumb, name, status, subject_emoji_lbl, subject_lbl, size_lbl):
             w.bind("<Button-1>", lambda e, p=path: self._select_item(p))
             w.bind("<Enter>", lambda e, it=item: self._row_hover(it, True))
             w.bind("<Leave>", lambda e, it=item: self._row_hover(it, False))
@@ -590,9 +613,10 @@ class App(ctk.CTk):
 
         # Subject label — shown once a crop result is available
         if result and result.subject and item["status"] in ("cropped", "dry_run"):
-            emoji = subject_emoji(result.subject)
-            item["subject_lbl"].configure(text=f"{emoji} {result.subject}", text_color=DIM)
+            item["subject_emoji_lbl"].configure(text=subject_emoji(result.subject))
+            item["subject_lbl"].configure(text=result.subject, text_color=DIM)
         else:
+            item["subject_emoji_lbl"].configure(text="")
             item["subject_lbl"].configure(text="")
 
         # File size badge with traffic-light colouring
@@ -632,9 +656,7 @@ class App(ctk.CTk):
         while True:
             path = self.thumb_jobs.get()
             try:
-                with Image.open(path) as im:
-                    im = ImageOps.exif_transpose(im).convert("RGB")
-                    im = ImageOps.fit(im, (58, 34), Image.LANCZOS)
+                im = make_thumbnail(path)
                 self.thumb_ready.put((path, im))
             except Exception:
                 pass
@@ -727,10 +749,15 @@ class App(ctk.CTk):
                 c.create_line(fxp, fyp - 16, fxp, fyp + 16, fill=ACCENT, width=1)
                 c.create_oval(fxp - 9, fyp - 9, fxp + 9, fyp + 9, outline=ACCENT, width=2)
                 label = f"target  {fx:.0f}%, {fy:.0f}%"
+                label_x = fxp + 14
                 if result.subject:
                     emoji = subject_emoji(result.subject)
-                    label = f"{emoji} {result.subject}  ·  {fx:.0f}%, {fy:.0f}%"
-                self._otext(fxp + 14, fyp - 14, label,
+                    label = f"{result.subject}  ·  {fx:.0f}%, {fy:.0f}%"
+                    # Drawn separately, in its native colors instead of the
+                    # accent tint, since Courier New has no emoji glyphs.
+                    self._otext(label_x, fyp - 14, emoji, ACCENT, self.f_emoji, anchor="w")
+                    label_x += self.f_emoji.measure(emoji) + 6
+                self._otext(label_x, fyp - 14, label,
                             ACCENT, ("Courier New", 10), anchor="w")
                 if result.crop_warning:
                     first_reason = result.crop_warning.split(";")[0].strip()
@@ -912,8 +939,8 @@ class App(ctk.CTk):
 
         adv = self._card(body, "Sending behavior")
         adv.grid_columnconfigure(1, weight=1)
-        add_field(adv, 0, "Retry Attempts", "max_retries", False, "Per photo on rate limit (default 3)")
-        add_field(adv, 1, "Retry Delay (secs)", "retry_delay", False, "Wait between retries (default 90)")
+        add_field(adv, 0, "Retry Attempts", "max_retries", False, "Per photo on rate limit (default 12)")
+        add_field(adv, 1, "Retry Delay (secs)", "retry_delay", False, "Wait between retries (default 300)")
 
         self._primary(body, "Save Settings", self._save_settings, height=46).pack(
             fill="x", pady=(2, 6))
@@ -1066,6 +1093,15 @@ class App(ctk.CTk):
         self.log_box.configure(state="disabled")
 
     def _poll_queues(self):
+        # A failure anywhere below must never stop this from being rescheduled —
+        # otherwise every queued UI update (thumbnails, progress, results) would
+        # silently stop forever for the rest of the session.
+        try:
+            self._poll_queues_once()
+        finally:
+            self.after(80, self._poll_queues)
+
+    def _poll_queues_once(self):
         # logs
         wrote = False
         try:
@@ -1100,19 +1136,21 @@ class App(ctk.CTk):
         except queue.Empty:
             pass
 
-        # thumbnails
+        # thumbnails — each one is isolated so a single bad/corrupt image can't
+        # drop the rest of the batch or (via the wrapper above) the whole poll loop.
         try:
             while True:
                 path, pil = self.thumb_ready.get_nowait()
                 item = self.item_by_path.get(path)
                 if item:
-                    img = ctk.CTkImage(light_image=pil, dark_image=pil, size=(58, 34))
-                    item["thumb_img"] = img
-                    item["thumb"].configure(image=img, text="")
+                    try:
+                        img = ctk.CTkImage(light_image=pil, dark_image=pil, size=THUMB_SIZE)
+                        item["thumb_img"] = img
+                        item["thumb"].configure(image=img, text="")
+                    except Exception:
+                        pass
         except queue.Empty:
             pass
-
-        self.after(80, self._poll_queues)
 
     # How long to linger on a finished photo's crop preview before jumping to
     # the next one that has started analyzing (ms).
@@ -1215,8 +1253,8 @@ class App(ctk.CTk):
         to_addr     = self.send_to_var.get().strip()
         smtp_host   = self.settings.get("smtp_host", "smtp.mail.yahoo.com").strip()
         smtp_port   = int(self.settings.get("smtp_port", "587") or "587")
-        max_retries = int(self.settings.get("max_retries", "3") or "3")
-        retry_delay = int(self.settings.get("retry_delay", "90") or "90")
+        max_retries = int(self.settings.get("max_retries", "12") or "12")
+        retry_delay = int(self.settings.get("retry_delay", "300") or "300")
 
         if not from_addr:
             messagebox.showerror("Missing Email", "Enter your From email address in Settings.")

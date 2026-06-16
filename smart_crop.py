@@ -575,8 +575,8 @@ def run_send(
     smtp_port: int,
     password: str,
     log_fn: LogFn = print,
-    max_retries: int = 3,
-    retry_delay: int = 90,
+    max_retries: int = 12,
+    retry_delay: int = 300,
     progress_fn: ProgressFn = _noop_progress,
 ) -> tuple[list[tuple[str, str]], int]:
     """

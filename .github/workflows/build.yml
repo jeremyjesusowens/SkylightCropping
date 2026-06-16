@@ -1,0 +1,102 @@
+name: Build App
+
+# Builds SkylightCropping on Windows and macOS.
+#   - Every push to main  -> downloadable artifacts (Actions tab)
+#   - Push a tag like v1.1 -> published GitHub Release with both binaries
+#   - "Run workflow" button -> on-demand build (optionally creates a release)
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Publish a release with this tag (e.g. v1.0). Leave blank to just build.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build executable
+        run: >
+          pyinstaller --onefile --windowed
+          --collect-data customtkinter
+          --name SkylightCropping app.py
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SkylightCropping
+          path: dist/SkylightCropping.exe
+          retention-days: 7
+
+      - name: Publish release (tag push)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: gh release create "$env:GITHUB_REF_NAME" "dist/SkylightCropping.exe" --title "$env:GITHUB_REF_NAME" --generate-notes
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Publish release (manual dispatch)
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        run: gh release create "${{ inputs.release_tag }}" "dist/SkylightCropping.exe" --title "${{ inputs.release_tag }}" --target "${{ github.sha }}" --generate-notes
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  build-mac:
+    runs-on: macos-latest
+    # For releases, wait for the Windows job to create the release first so
+    # the mac job can upload to it. For plain branch pushes both run in parallel.
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build executable
+        run: >
+          pyinstaller --onefile --windowed
+          --collect-data customtkinter
+          --name SkylightCropping app.py
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SkylightCropping-mac
+          path: dist/SkylightCropping
+          retention-days: 7
+
+      - name: Publish release (tag push)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: gh release upload "$GITHUB_REF_NAME" "dist/SkylightCropping" --clobber
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Publish release (manual dispatch)
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        run: gh release upload "${{ inputs.release_tag }}" "dist/SkylightCropping" --clobber
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

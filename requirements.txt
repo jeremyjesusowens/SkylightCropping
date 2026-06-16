@@ -1,4 +1,4 @@
 anthropic>=0.104.0
 Pillow>=12.2.0
 customtkinter>=5.2.0
-keyring>=24.0.0
+keyring>=25.7.0

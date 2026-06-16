@@ -14,6 +14,13 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
+try:
+    import keyring
+    import keyring.errors
+    _KEYRING_AVAILABLE = True
+except Exception:
+    _KEYRING_AVAILABLE = False
+
 import customtkinter as ctk
 from PIL import Image, ImageOps, ImageTk
 
@@ -32,6 +39,34 @@ _SETTINGS_DIR = (
 )
 SETTINGS_FILE = _SETTINGS_DIR / "settings.json"
 DEFAULT_TO = ""  # set your Skylight frame's email address in the app Settings
+
+_KEYRING_SERVICE = "SkylightCropping"
+_KEYRING_KEYS = {"api_key", "smtp_password"}
+
+
+def _kr_get(key: str) -> str:
+    if not _KEYRING_AVAILABLE:
+        return ""
+    try:
+        return keyring.get_password(_KEYRING_SERVICE, key) or ""
+    except Exception:
+        return ""
+
+
+def _kr_set(key: str, value: str) -> bool:
+    if not _KEYRING_AVAILABLE:
+        return False
+    try:
+        if value:
+            keyring.set_password(_KEYRING_SERVICE, key, value)
+        else:
+            try:
+                keyring.delete_password(_KEYRING_SERVICE, key)
+            except keyring.errors.PasswordDeleteError:
+                pass
+        return True
+    except Exception:
+        return False
 
 # --- Aurora / Twilight palette ---------------------------------------------
 BG        = "#0b0c14"   # window background
@@ -77,12 +112,22 @@ def load_settings() -> dict:
             defaults.update(json.loads(SETTINGS_FILE.read_text(encoding="utf-8")))
         except Exception:
             pass
+    # Keyring values take precedence over any plaintext remnants in the JSON file.
+    for key in _KEYRING_KEYS:
+        kr_val = _kr_get(key)
+        if kr_val:
+            defaults[key] = kr_val
     return defaults
 
 
 def save_settings(settings: dict) -> None:
+    to_save = dict(settings)
+    for key in _KEYRING_KEYS:
+        value = to_save.pop(key, "")
+        if not _kr_set(key, value):
+            to_save[key] = value  # keyring unavailable — keep in plaintext as fallback
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SETTINGS_FILE.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    SETTINGS_FILE.write_text(json.dumps(to_save, indent=2), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------

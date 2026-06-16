@@ -40,6 +40,8 @@ from PIL import Image, ImageOps
 # Constants
 # ---------------------------------------------------------------------------
 
+VERSION = "1.0.0"
+
 TARGET_RATIO = 16 / 9
 MAX_FILE_BYTES = 24 * 1024 * 1024  # 24 MB
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
@@ -439,6 +441,12 @@ def run_crop(
         try:
             result = process_image(client, img_path, out_path, model, dry_run,
                                    log=log_fn, index=i, total=total)
+        except anthropic.AuthenticationError:
+            msg = "Invalid API key — verify your key at console.anthropic.com"
+            log_fn(f"  ✗ {msg}")
+            result_fn(CropResult(path=str(img_path), status="failed", error=msg))
+            failures.extend((img.name, msg) for img in images[i - 1:])
+            break  # no point continuing with an invalid key
         except Exception as exc:
             log_fn(f"  ✗ Failed: {exc}")
             failures.append((img_path.name, str(exc)))
@@ -610,6 +618,7 @@ def main() -> None:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
     sub.required = True
 

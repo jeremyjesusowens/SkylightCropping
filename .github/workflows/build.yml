@@ -1,7 +1,7 @@
 name: Build App
 
 # Builds SkylightCropping on Windows and macOS.
-#   - Every push to main  -> downloadable artifacts (Actions tab)
+#   - Every push to main  -> lint + test + downloadable artifacts (Actions tab)
 #   - Push a tag like v1.1 -> published GitHub Release with both binaries
 #   - "Run workflow" button -> on-demand build (optionally creates a release)
 
@@ -20,7 +20,40 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Lint
+        run: ruff check .
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+  build-windows:
+    needs: [lint, test]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,11 +61,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+        run: pip install -r requirements.txt pyinstaller
 
       - name: Build executable
         run: >
@@ -40,41 +72,26 @@ jobs:
           --collect-data customtkinter
           --name SkylightCropping app.py
 
-      - name: Upload build artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SkylightCropping
+          name: SkylightCropping-windows
           path: dist/SkylightCropping.exe
           retention-days: 7
 
-      - name: Publish release (tag push)
-        if: startsWith(github.ref, 'refs/tags/')
-        run: gh release create "$env:GITHUB_REF_NAME" "dist/SkylightCropping.exe" --title "$env:GITHUB_REF_NAME" --generate-notes
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-
-      - name: Publish release (manual dispatch)
-        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
-        run: gh release create "${{ inputs.release_tag }}" "dist/SkylightCropping.exe" --title "${{ inputs.release_tag }}" --target "${{ github.sha }}" --generate-notes
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-
   build-mac:
+    needs: [lint, test]
     runs-on: macos-latest
-    # For releases, wait for the Windows job to create the release first so
-    # the mac job can upload to it. For plain branch pushes both run in parallel.
-    needs: build
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+        run: pip install -r requirements.txt pyinstaller
 
       - name: Build executable
         run: >
@@ -82,21 +99,49 @@ jobs:
           --collect-data customtkinter
           --name SkylightCropping app.py
 
-      - name: Upload build artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: SkylightCropping-mac
           path: dist/SkylightCropping
           retention-days: 7
 
+  publish:
+    needs: [build-windows, build-mac]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: SkylightCropping-windows
+          path: artifacts/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: SkylightCropping-mac
+          path: artifacts/
+
       - name: Publish release (tag push)
         if: startsWith(github.ref, 'refs/tags/')
-        run: gh release upload "$GITHUB_REF_NAME" "dist/SkylightCropping" --clobber
+        run: >
+          gh release create "$GITHUB_REF_NAME"
+          artifacts/SkylightCropping.exe
+          artifacts/SkylightCropping
+          --title "$GITHUB_REF_NAME"
+          --generate-notes
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
 
       - name: Publish release (manual dispatch)
         if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
-        run: gh release upload "${{ inputs.release_tag }}" "dist/SkylightCropping" --clobber
+        run: >
+          gh release create "${{ inputs.release_tag }}"
+          artifacts/SkylightCropping.exe
+          artifacts/SkylightCropping
+          --title "${{ inputs.release_tag }}"
+          --target "${{ github.sha }}"
+          --generate-notes
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}

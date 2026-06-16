@@ -11,6 +11,7 @@ import queue
 import sys
 import threading
 import tkinter as tk
+from collections import Counter
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
@@ -82,11 +83,34 @@ MUTED     = "#838aa3"   # secondary text
 DIM       = "#5b6178"   # tertiary text
 DONE      = "#5fd1b0"   # success
 ERRC      = "#ff6b6b"   # failure
+WARN      = "#e8a328"   # caution / crop warning
 THUMB     = "#1b1d2e"   # thumbnail placeholder
 SEL       = "#1d2030"   # selected row
 HOVER     = "#191b2a"   # subtle hover
 
 PREVIEW_MAX_PX = 1600    # cap for the in-app preview copy (display only)
+
+_SUBJECT_EMOJI: dict[str, str] = {
+    "heron": "🦤", "egret": "🦤", "crane": "🦢", "eagle": "🦅", "hawk": "🦅",
+    "osprey": "🦅", "falcon": "🦅", "owl": "🦉", "duck": "🦆", "goose": "🦆",
+    "swan": "🦢", "pelican": "🐦", "bird": "🐦",
+    "alligator": "🐊", "crocodile": "🐊",
+    "deer": "🦌", "fox": "🦊", "bear": "🐻", "wolf": "🐺", "coyote": "🐺",
+    "dog": "🐕", "cat": "🐈", "horse": "🐎", "rabbit": "🐇", "squirrel": "🐿️",
+    "turtle": "🐢", "snake": "🐍", "lizard": "🦎", "frog": "🐸",
+    "fish": "🐟", "dolphin": "🐬", "whale": "🐋", "seal": "🦭",
+    "butterfly": "🦋", "dragonfly": "🪲", "bee": "🐝",
+    "person": "🧍", "people": "👥", "child": "🧒",
+    "flower": "🌸", "tree": "🌳", "landscape": "🏞️", "sunset": "🌅",
+}
+
+
+def subject_emoji(subject: str) -> str:
+    s = subject.lower()
+    for keyword, emoji in _SUBJECT_EMOJI.items():
+        if keyword in s:
+            return emoji
+    return "📷"
 
 
 def load_settings() -> dict:
@@ -507,25 +531,32 @@ class App(ctk.CTk):
         if path in self.item_by_path:
             return
         row = ctk.CTkFrame(self.queue_list, fg_color="transparent", corner_radius=8,
-                           height=56)
+                           height=72)
         row.pack(fill="x", pady=2)
         row.pack_propagate(False)
         thumb = ctk.CTkLabel(row, text="", width=58, height=34, fg_color=THUMB,
                              corner_radius=4)
-        thumb.place(x=10, y=11)
+        thumb.place(x=10, y=19)
         disp_name = Path(path).name
         if len(disp_name) > 28:
             disp_name = disp_name[:25] + "…"
         name = ctk.CTkLabel(row, text=disp_name, font=self.f_mono,
                             text_color=MUTED, anchor="w")
-        name.place(x=80, y=7)
+        name.place(x=80, y=5)
         status = ctk.CTkLabel(row, text="● queued", font=self.f_small,
                               text_color=DIM, anchor="w")
-        status.place(x=80, y=30)
+        status.place(x=80, y=26)
+        subject_lbl = ctk.CTkLabel(row, text="", font=self.f_small,
+                                   text_color=DIM, anchor="w")
+        subject_lbl.place(x=80, y=48)
+        size_lbl = ctk.CTkLabel(row, text="", font=self.f_small,
+                                text_color=DIM, anchor="e")
+        size_lbl.place(relx=1.0, x=-10, y=10, anchor="ne")
 
         item = {"path": path, "status": "queued", "result": None, "row": row,
-                "thumb": thumb, "name": name, "status_lbl": status, "thumb_img": None}
-        for w in (row, thumb, name, status):
+                "thumb": thumb, "name": name, "status_lbl": status,
+                "subject_lbl": subject_lbl, "size_lbl": size_lbl, "thumb_img": None}
+        for w in (row, thumb, name, status, subject_lbl, size_lbl):
             w.bind("<Button-1>", lambda e, p=path: self._select_item(p))
             w.bind("<Enter>", lambda e, it=item: self._row_hover(it, True))
             w.bind("<Leave>", lambda e, it=item: self._row_hover(it, False))
@@ -540,6 +571,7 @@ class App(ctk.CTk):
         item["row"].configure(fg_color=HOVER if on else "transparent")
 
     def _update_row(self, item):
+        result = item.get("result")
         status_map = {
             "queued":    ("● queued", DIM),
             "now":       ("● analyzing…", ACCENT),
@@ -549,9 +581,34 @@ class App(ctk.CTk):
             "failed":    ("● failed", ERRC),
         }
         text, color = status_map.get(item["status"], ("● queued", DIM))
+        if result and result.crop_warning and item["status"] in ("cropped", "dry_run"):
+            text = text.replace("●", "⚠", 1)
+            color = WARN
         item["status_lbl"].configure(text=text, text_color=color)
         item["name"].configure(
             text_color=TXT if item["path"] == self.current_path else MUTED)
+
+        # Subject label — shown once a crop result is available
+        if result and result.subject and item["status"] in ("cropped", "dry_run"):
+            emoji = subject_emoji(result.subject)
+            item["subject_lbl"].configure(text=f"{emoji} {result.subject}", text_color=DIM)
+        else:
+            item["subject_lbl"].configure(text="")
+
+        # File size badge with traffic-light colouring
+        if result and result.output_size_bytes and item["status"] == "cropped":
+            mb = result.output_size_bytes / 1024 / 1024
+            q = result.compression_quality
+            size_text = f"{mb:.1f} MB"
+            if q is not None and q < 70:
+                size_color = ERRC
+            elif q is not None and q < 95:
+                size_color = WARN
+            else:
+                size_color = DONE
+            item["size_lbl"].configure(text=size_text, text_color=size_color)
+        else:
+            item["size_lbl"].configure(text="")
 
     def _select_item(self, path: str):
         self.current_path = path
@@ -671,9 +728,14 @@ class App(ctk.CTk):
                 c.create_oval(fxp - 9, fyp - 9, fxp + 9, fyp + 9, outline=ACCENT, width=2)
                 label = f"target  {fx:.0f}%, {fy:.0f}%"
                 if result.subject:
-                    label = f"{result.subject}  ·  {fx:.0f}%, {fy:.0f}%"
+                    emoji = subject_emoji(result.subject)
+                    label = f"{emoji} {result.subject}  ·  {fx:.0f}%, {fy:.0f}%"
                 self._otext(fxp + 14, fyp - 14, label,
                             ACCENT, ("Courier New", 10), anchor="w")
+                if result.crop_warning:
+                    first_reason = result.crop_warning.split(";")[0].strip()
+                    self._otext(x1 + 6, y1 + 14, f"⚠ {first_reason}",
+                                WARN, ("Courier New", 9), anchor="w")
         elif item["status"] in ("now", "analyzing"):
             c.create_rectangle(ox + 10, oy + 10, ox + 132, oy + 36,
                                fill=PANEL, outline=ACCENT, width=1)
@@ -728,13 +790,16 @@ class App(ctk.CTk):
         fx = (ix / dw) * 100
         fy = (iy / dh) * 100
         # Update result immediately so preview redraws without API call
-        new_box = compute_crop_box(ow, oh, fx, fy)
+        new_box, _ = compute_crop_box(ow, oh, fx, fy)
         item["result"] = CropResult(
             path=result.path, status=result.status,
             width=ow, height=oh,
             focal=(fx, fy), box=new_box,
             output_path=result.output_path,
             subject=result.subject,
+            confidence=result.confidence,
+            focal_box=result.focal_box,
+            crop_warning=result.crop_warning,
         )
         self._render_preview(item)
         # Re-save in background (skip if dry run or no output path)
@@ -1192,6 +1257,44 @@ class App(ctk.CTk):
             for name, err in failures:
                 self._log(f"  • {name}: {err}")
         self._log(f"\n═══ Finished: {done}/{total} {verb} ═══")
+
+        if verb == "cropped" and done > 0:
+            # Subject breakdown
+            subjects = Counter(
+                it["result"].subject for it in self.items
+                if it.get("result") and it["result"].subject
+                and it["result"].status in ("cropped", "dry_run")
+            )
+            if subjects:
+                parts = [f"{cnt} {subj}" for subj, cnt in subjects.most_common()]
+                self._log("  " + "  ·  ".join(parts))
+
+            # Compression summary — only photos that needed quality reduction
+            compressed = [
+                it["result"] for it in self.items
+                if it.get("result")
+                and it["result"].compression_quality is not None
+                and it["result"].compression_quality < 95
+                and it["result"].output_size_bytes is not None
+            ]
+            if compressed:
+                min_q = min(r.compression_quality for r in compressed)
+                avg_mb = (
+                    sum(r.output_size_bytes for r in compressed)
+                    / len(compressed) / 1024 / 1024
+                )
+                self._log(
+                    f"  {len(compressed)}/{done} compressed to fit 24 MB limit"
+                    f" — avg {avg_mb:.1f} MB, lowest quality: {min_q}"
+                )
+
+            # Warning tally
+            warned = [
+                it for it in self.items
+                if it.get("result") and it["result"].crop_warning
+            ]
+            if warned:
+                self._log(f"  ⚠ {len(warned)} photo(s) flagged for review — click to inspect")
 
 
 # ---------------------------------------------------------------------------

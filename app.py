@@ -7,7 +7,9 @@ item in the queue can be clicked to review its crop during or after processing.
 """
 
 import json
+import os
 import queue
+import subprocess
 import sys
 import threading
 import tkinter as tk
@@ -25,6 +27,8 @@ except Exception:
 import customtkinter as ctk
 from PIL import Image, ImageOps, ImageTk
 
+from prompt_eval import DEFAULT_MODEL as PROMPT_EVAL_DEFAULT_MODEL
+from prompt_eval import PROMPT_VARIANTS, run_prompt_eval
 from smart_crop import (FALLBACK_MODELS, CropResult, collect_images,
                         compute_crop_box, list_models, recrop_image, run_crop,
                         run_send)
@@ -124,6 +128,18 @@ def make_thumbnail(path: str, size: tuple[int, int] = THUMB_SIZE) -> Image.Image
         im = ImageOps.fit(im, size, Image.LANCZOS)
         im.load()  # fully decode before the file handle closes
     return im
+
+
+def _open_folder(path: Path) -> None:
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)  # noqa
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+    except Exception:
+        pass
 
 
 def load_settings() -> dict:
@@ -942,10 +958,131 @@ class App(ctk.CTk):
         add_field(adv, 0, "Retry Attempts", "max_retries", False, "Per photo on rate limit (default 12)")
         add_field(adv, 1, "Retry Delay (secs)", "retry_delay", False, "Wait between retries (default 300)")
 
+        self._build_prompt_lab_card(body)
+
         self._primary(body, "Save Settings", self._save_settings, height=46).pack(
             fill="x", pady=(2, 6))
         ctk.CTkLabel(body, text=f"Saved to {SETTINGS_FILE}", font=self.f_small,
                      text_color=DIM, anchor="w").pack(fill="x")
+
+    # =======================================================================
+    # Prompt Lab — compares wording variants of the focal-point prompt
+    # =======================================================================
+
+    def _build_prompt_lab_card(self, body):
+        lab = self._card(body, "Prompt Lab (experimental)")
+        lab.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(lab, text="Test photos", font=self.f_label, text_color=MUTED,
+                     anchor="w").grid(row=0, column=0, sticky="w", pady=7)
+        lf = ctk.CTkFrame(lab, fg_color="transparent")
+        lf.grid(row=0, column=1, sticky="ew", padx=(12, 0), pady=7)
+        lf.grid_columnconfigure(0, weight=1)
+        default_test_dir = Path(__file__).parent / "test_photos"
+        self.eval_folder_var = ctk.StringVar(
+            value=str(default_test_dir) if default_test_dir.is_dir() else "")
+        self._entry(lf, self.eval_folder_var,
+                    "Folder of sample photos").grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self._ghost(lf, "Browse", self._browse_eval_folder, width=84).grid(row=0, column=1)
+
+        ctk.CTkLabel(lab, text="Prompt variants", font=self.f_label, text_color=MUTED,
+                     anchor="nw").grid(row=1, column=0, sticky="nw", pady=7)
+        vf = ctk.CTkFrame(lab, fg_color="transparent")
+        vf.grid(row=1, column=1, sticky="w", pady=7)
+        self.eval_variant_vars: dict[str, ctk.BooleanVar] = {}
+        for i, name in enumerate(PROMPT_VARIANTS):
+            var = ctk.BooleanVar(value=True)
+            self.eval_variant_vars[name] = var
+            ctk.CTkCheckBox(vf, text=name, variable=var, font=self.f_label,
+                            text_color=TXT, fg_color=ACCENT, hover_color=ACCENT_HV,
+                            border_color=STROKE, checkmark_color=ACCENT_INK).grid(
+                row=i, column=0, sticky="w", pady=2)
+
+        ctk.CTkLabel(lab, text="Test model", font=self.f_label, text_color=MUTED,
+                     anchor="w").grid(row=2, column=0, sticky="w", pady=7)
+        model_list = self.settings.get("model_list") or list(FALLBACK_MODELS)
+        default_eval_model = (
+            PROMPT_EVAL_DEFAULT_MODEL if PROMPT_EVAL_DEFAULT_MODEL in model_list
+            else model_list[-1]
+        )
+        self.eval_model_var = ctk.StringVar(value=default_eval_model)
+        eval_model_values = model_list if default_eval_model in model_list else [default_eval_model, *model_list]
+        self.eval_model_menu = ctk.CTkOptionMenu(
+            lab, values=eval_model_values, variable=self.eval_model_var, width=260,
+            fg_color=PANEL2, button_color=STROKE, button_hover_color=ACCENT,
+            text_color=TXT, dropdown_fg_color=PANEL, dropdown_text_color=TXT,
+            dropdown_hover_color=HOVER)
+        self.eval_model_menu.grid(row=2, column=1, sticky="w", pady=7)
+
+        ctk.CTkLabel(
+            lab, text="Compares prompt wordings on a small photo set and saves one "
+            "side-by-side comparison image per photo to eval_out/ so you can pick "
+            "the best crop by eye. One API call per photo per variant checked above.",
+            font=self.f_small, text_color=DIM, anchor="w", wraplength=460, justify="left",
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 8))
+
+        self.prompt_eval_btn = self._primary(
+            lab, "Run Prompt Test", self._run_prompt_eval, height=40)
+        self.prompt_eval_btn.grid(row=4, column=0, columnspan=2, sticky="ew")
+
+    def _browse_eval_folder(self):
+        folder = filedialog.askdirectory(title="Select folder of test photos")
+        if folder:
+            self.eval_folder_var.set(folder)
+
+    def _run_prompt_eval(self):
+        if self._running:
+            return
+        api_key = self.settings_vars["api_key"].get().strip()
+        if not api_key:
+            messagebox.showerror("Missing API Key", "Enter your Anthropic API key above first.")
+            return
+
+        folder = self.eval_folder_var.get().strip()
+        if not folder or not Path(folder).is_dir():
+            messagebox.showwarning("No Folder", "Select a folder of test photos first.")
+            return
+        images = collect_images([folder], log=lambda _: None)
+        if not images:
+            messagebox.showwarning("No Photos", "No supported images found in that folder.")
+            return
+
+        variant_names = [name for name, var in self.eval_variant_vars.items() if var.get()]
+        if not variant_names:
+            messagebox.showwarning("No Variants", "Check at least one prompt variant to test.")
+            return
+
+        model = self.eval_model_var.get()
+        n_calls = len(images) * len(variant_names)
+        if not messagebox.askyesno(
+            "Run Prompt Test",
+            f"This will make {n_calls} API call(s) on {model}\n"
+            f"({len(images)} photo(s) × {len(variant_names)} variant(s)).\n\nProceed?",
+        ):
+            return
+
+        out_dir = Path(__file__).parent / "eval_out"
+        self.progress.set(0)
+        self.progress_count.configure(text=f"0 / {len(images)}")
+        self._set_busy(True, "Testing prompts…")
+        self._log(f"\n═══ Prompt test: {len(images)} photo(s) × {variant_names} on {model} ═══")
+
+        def worker():
+            try:
+                outputs = run_prompt_eval(
+                    images=images, variant_names=variant_names, model=model,
+                    api_key=api_key, out_dir=out_dir,
+                    log_fn=self._log, progress_fn=self._post_progress,
+                )
+            except Exception as exc:
+                self._log(f"\nUnexpected error: {exc}")
+                self.after(0, lambda: self._set_busy(False, "Error"))
+            else:
+                self._log(f"\n═══ Finished: {len(outputs)} comparison image(s) in {out_dir} ═══")
+                self.after(0, lambda: self._set_busy(False, "Prompt test complete"))
+                self.after(0, lambda: _open_folder(out_dir))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # =======================================================================
     # File / folder pickers
@@ -1183,6 +1320,7 @@ class App(ctk.CTk):
         state = "disabled" if busy else "normal"
         self.crop_btn.configure(state=state)
         self.send_btn.configure(state=state)
+        self.prompt_eval_btn.configure(state=state)
         self.status_label.configure(text=status, text_color=ACCENT if busy else MUTED)
 
     # =======================================================================

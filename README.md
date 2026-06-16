@@ -9,9 +9,9 @@ Claude finds your subject — you get a clean widescreen frame.
 
 ## Why this exists
 
-Skylight digital frames don't cleanly display 16:9 photos unless you feed them a *mix* of aspect ratios for the frame to arrange together. With a uniform library that never happens — the frame letterboxes or awkwardly crops every shot.
+Skylight digital frames don't cleanly display 16:9 photos unless you feed them a *mix* of aspect ratios for the frame to arrange together. With a uniform library that never happens — the frame letterboxes every shot.
 
-All my photos come from a Micro Four Thirds camera (a 4:3 sensor), so every image needs cropping to 16:9 before it looks right on the frame. Doing that by hand for hundreds of bird and wildlife photos — and keeping the subject well-framed each time — was tedious. So I automated it: Claude looks at each photo, finds the subject, and crops to a clean 16:9 that actually keeps the animal in frame.
+All my photos come from a Micro Four Thirds camera (a 4:3 sensor), so every image needs cropping to 16:9 before it looks right on the frame. Doing that by hand for thousands of bird and wildlife photos — and keeping the subject well-framed each time — was tedious. So I automated it: Claude looks at each photo, finds the subject, and crops to a clean 16:9 that actually keeps the animal in frame.
 
 ---
 

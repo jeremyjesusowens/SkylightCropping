@@ -35,6 +35,81 @@ from smart_crop import FOCAL_POINT_PROMPT, collect_images, encode_image
 # prompt. Keys become the labels shown on each comparison image.
 PROMPT_VARIANTS = {
     "baseline": FOCAL_POINT_PROMPT,
+
+    # Centering on the raw bounding box midpoint can crowd a subject that is
+    # facing or moving in a clear direction. This asks Claude to bias the box
+    # toward the subject's back so the final crop leaves room ahead of it.
+    "lead_room": (
+        "This photo will be cropped to a 16:9 aspect ratio for a digital picture frame. "
+        "Your job is to identify the best center point for that crop.\n\n"
+        "Step 1 — Identify the PRIMARY SUBJECT: the single animal, person, or object "
+        "the viewer's eye is drawn to first. If the image is a pure landscape with no "
+        "clear subject, use the most visually interesting area.\n\n"
+        "Step 2 — Draw an imaginary tight bounding box around that subject's PRIMARY BODY MASS only. "
+        "Deliberately EXCLUDE extremities that extend far from the body: "
+        "do NOT include beaks, bills, tails, wingtips, outstretched legs, feet, antlers, "
+        "fins, or any thin appendage that projects away from the torso. "
+        "Only the core torso (and head when it is close to the torso).\n\n"
+        "Step 2.5 — If the subject is clearly facing or moving in one direction, shift the "
+        "box 10-15% of its width AWAY from that direction (toward the subject's back), so the "
+        "crop leaves breathing room in front of it instead of crowding the frame edge it's "
+        "heading toward.\n\n"
+        "Step 3 — Rate your confidence (0-100) that the bounding box will produce a "
+        "well-composed 16:9 crop. Give a LOW score if: the subject is very close to the "
+        "frame edge, the subject fills nearly the entire image leaving no crop flexibility, "
+        "there is no clear primary subject, or the subject's most compelling feature "
+        "(e.g. a bird's full wingspan in flight) cannot be captured without extremities.\n\n"
+        "Step 4 — Return ONLY a JSON object with no explanation:\n"
+        '{"subject": "<brief description e.g. alligator, great blue heron>", '
+        '"x1": <left edge of box, 0-100>, "y1": <top edge of box, 0-100>, '
+        '"x2": <right edge of box, 0-100>, "y2": <bottom edge of box, 0-100>, '
+        '"confidence": <0-100>}\n\n'
+        "All coordinate values are percentages of image dimensions."
+    ),
+
+    # Trims the baseline's repetition to test whether a shorter (cheaper,
+    # faster) prompt holds the same quality.
+    "concise": (
+        "Find the best 16:9 crop center for this digital-frame photo.\n\n"
+        "1. Identify the primary subject (the thing the eye is drawn to first; for a "
+        "landscape with no clear subject, use the most visually interesting area).\n"
+        "2. Draw a tight box around its core body mass only — exclude beaks, tails, "
+        "outstretched limbs, wingtips, or anything projecting away from the torso.\n"
+        "3. Confidence 0-100: score low if the subject is near an edge, fills the frame, "
+        "is unclear, or its key feature (e.g. a full wingspan) needs an excluded extremity.\n\n"
+        "Return ONLY this JSON, no explanation:\n"
+        '{"subject": "<brief description>", "x1": <0-100>, "y1": <0-100>, '
+        '"x2": <0-100>, "y2": <0-100>, "confidence": <0-100>}'
+    ),
+
+    # The baseline forces a single subject, which is ambiguous for group
+    # photos — a common case for a family picture frame.
+    "multi_subject": (
+        "This photo will be cropped to a 16:9 aspect ratio for a digital picture frame. "
+        "Your job is to identify the best center point for that crop.\n\n"
+        "Step 1 — Identify the PRIMARY SUBJECT(S): the animal(s), person(s), or object "
+        "the viewer's eye is drawn to first. If there are several people or animals "
+        "clearly grouped together (e.g. a family, a couple, a small herd), treat them as "
+        "ONE subject and box the whole group. If the image is a pure landscape with no "
+        "clear subject, use the most visually interesting area.\n\n"
+        "Step 2 — Draw an imaginary tight bounding box around the subject's (or group's) "
+        "PRIMARY BODY MASS only. Deliberately EXCLUDE extremities that extend far from the "
+        "body: do NOT include beaks, bills, tails, wingtips, outstretched legs, feet, "
+        "antlers, fins, or any thin appendage that projects away from the torso. Only the "
+        "core torso (and head when close to the torso) of each member of the group.\n\n"
+        "Step 3 — Rate your confidence (0-100) that the bounding box will produce a "
+        "well-composed 16:9 crop. Give a LOW score if: the subject is very close to the "
+        "frame edge, the subject(s) fill nearly the entire image leaving no crop "
+        "flexibility, there is no clear primary subject, group members are too spread out "
+        "to box tightly together, or the subject's most compelling feature (e.g. a bird's "
+        "full wingspan in flight) cannot be captured without extremities.\n\n"
+        "Step 4 — Return ONLY a JSON object with no explanation:\n"
+        '{"subject": "<brief description e.g. \'family of four\', great blue heron>", '
+        '"x1": <left edge of box, 0-100>, "y1": <top edge of box, 0-100>, '
+        '"x2": <right edge of box, 0-100>, "y2": <bottom edge of box, 0-100>, '
+        '"confidence": <0-100>}\n\n'
+        "All coordinate values are percentages of image dimensions."
+    ),
 }
 
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"

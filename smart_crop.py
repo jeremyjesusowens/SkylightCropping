@@ -55,19 +55,27 @@ MEDIA_TYPES = {
 }
 
 FOCAL_POINT_PROMPT = (
-    "Look at this photo and follow these steps:\n\n"
+    "This photo will be cropped to a 16:9 aspect ratio for a digital picture frame. "
+    "Your job is to identify the best center point for that crop.\n\n"
     "Step 1 — Identify the PRIMARY SUBJECT: the single animal, person, or object "
-    "the viewer's eye is drawn to first.\n\n"
+    "the viewer's eye is drawn to first. If the image is a pure landscape with no "
+    "clear subject, use the most visually interesting area.\n\n"
     "Step 2 — Draw an imaginary tight bounding box around that subject's PRIMARY BODY MASS only. "
     "Deliberately EXCLUDE extremities that extend far from the body: "
     "do NOT include beaks, bills, tails, wingtips, outstretched legs, feet, antlers, "
     "fins, or any thin appendage that projects away from the torso. "
     "Only the core torso (and head when it is close to the torso).\n\n"
-    "Step 3 — Return ONLY a JSON object with no explanation:\n"
+    "Step 3 — Rate your confidence (0-100) that the bounding box will produce a "
+    "well-composed 16:9 crop. Give a LOW score if: the subject is very close to the "
+    "frame edge, the subject fills nearly the entire image leaving no crop flexibility, "
+    "there is no clear primary subject, or the subject's most compelling feature "
+    "(e.g. a bird's full wingspan in flight) cannot be captured without extremities.\n\n"
+    "Step 4 — Return ONLY a JSON object with no explanation:\n"
     '{"subject": "<brief description e.g. alligator, great blue heron>", '
     '"x1": <left edge of box, 0-100>, "y1": <top edge of box, 0-100>, '
-    '"x2": <right edge of box, 0-100>, "y2": <bottom edge of box, 0-100>}\n\n'
-    "All values are percentages: 0 = left/top edge of image, 100 = right/bottom edge."
+    '"x2": <right edge of box, 0-100>, "y2": <bottom edge of box, 0-100>, '
+    '"confidence": <0-100>}\n\n'
+    "All coordinate values are percentages of image dimensions."
 )
 
 DEFAULT_TO = ""  # set your Skylight frame's email address in the app Settings
@@ -93,6 +101,11 @@ class CropResult:
     output_path: Optional[str] = None
     error: Optional[str] = None
     subject: Optional[str] = None                      # e.g. "alligator", "great blue heron"
+    confidence: Optional[int] = None                   # Claude's confidence 0-100
+    focal_box: Optional[tuple[float, float, float, float]] = None  # (x1,y1,x2,y2) pct from Claude
+    output_size_bytes: Optional[int] = None
+    compression_quality: Optional[int] = None          # None = no lossy compression applied
+    crop_warning: Optional[str] = None                 # set when crop quality may be poor
 
 
 ResultFn = Callable[["CropResult"], None]
@@ -182,16 +195,16 @@ def encode_image(path: Path) -> tuple[str, str]:
 
 def get_focal_point(
     client: anthropic.Anthropic, image_path: Path, model: str
-) -> tuple[float, float, str]:
+) -> tuple[float, float, str, int, tuple[float, float, float, float]]:
     """Ask Claude where the main subject is.
 
-    Returns (x_pct, y_pct, subject_description) where x/y are in [0, 100].
-    Claude returns a bounding box; we compute the centre as the target point.
+    Returns (x_pct, y_pct, subject_description, confidence, (x1, y1, x2, y2))
+    where x/y/bbox values are in [0, 100] and confidence is 0-100.
     """
     data, media_type = encode_image(image_path)
     response = client.messages.create(
         model=model,
-        max_tokens=256,
+        max_tokens=300,
         messages=[
             {
                 "role": "user",
@@ -219,31 +232,61 @@ def get_focal_point(
         raise ValueError(f"No JSON in response: {text!r}")
     data_parsed = json.loads(text[start:end])
     subject = str(data_parsed.get("subject", "subject"))
-    # Derive centre from bounding box corners
-    x1 = float(data_parsed["x1"])
-    y1 = float(data_parsed["y1"])
-    x2 = float(data_parsed["x2"])
-    y2 = float(data_parsed["y2"])
-    x = max(0.0, min(100.0, (x1 + x2) / 2))
-    y = max(0.0, min(100.0, (y1 + y2) / 2))
-    return x, y, subject
+    confidence = max(0, min(100, int(data_parsed.get("confidence", 80))))
+    x1 = max(0.0, min(100.0, float(data_parsed["x1"])))
+    y1 = max(0.0, min(100.0, float(data_parsed["y1"])))
+    x2 = max(0.0, min(100.0, float(data_parsed["x2"])))
+    y2 = max(0.0, min(100.0, float(data_parsed["y2"])))
+    x = (x1 + x2) / 2
+    y = (y1 + y2) / 2
+    return x, y, subject, confidence, (x1, y1, x2, y2)
 
 
-def compute_crop_box(img_w: int, img_h: int, fx_pct: float, fy_pct: float) -> tuple[int, int, int, int]:
-    """Return (left, upper, right, lower) for the largest 16:9 crop centred on the focal point."""
+def compute_crop_box(
+    img_w: int, img_h: int, fx_pct: float, fy_pct: float
+) -> tuple[tuple[int, int, int, int], bool]:
+    """Return ((left, upper, right, lower), clamped) for the largest 16:9 crop.
+
+    clamped is True when the focal point was close enough to the frame edge that
+    the crop had to slide, meaning the subject may not be well-centred in the output.
+    """
     fx = fx_pct / 100 * img_w
     fy = fy_pct / 100 * img_h
 
     if img_w / img_h > TARGET_RATIO:
         crop_w = round(img_h * TARGET_RATIO)
-        left = round(fx - crop_w / 2)
-        left = max(0, min(left, img_w - crop_w))
-        return left, 0, left + crop_w, img_h
+        ideal_left = round(fx - crop_w / 2)
+        left = max(0, min(ideal_left, img_w - crop_w))
+        return (left, 0, left + crop_w, img_h), left != ideal_left
     else:
         crop_h = round(img_w / TARGET_RATIO)
-        top = round(fy - crop_h / 2)
-        top = max(0, min(top, img_h - crop_h))
-        return 0, top, img_w, top + crop_h
+        ideal_top = round(fy - crop_h / 2)
+        top = max(0, min(ideal_top, img_h - crop_h))
+        return (0, top, img_w, top + crop_h), top != ideal_top
+
+
+def _crop_quality_warning(
+    confidence: int,
+    clamped: bool,
+    focal_box: tuple[float, float, float, float],
+    img_w: int,
+    img_h: int,
+) -> Optional[str]:
+    """Return a short warning string if the crop may be poor, or None if it looks fine."""
+    reasons = []
+    if confidence < 60:
+        reasons.append("low confidence")
+    if clamped:
+        reasons.append("subject near frame edge")
+    x1, y1, x2, y2 = focal_box
+    # Check whether the subject span leaves very little room in the cropping dimension.
+    if img_w / img_h > TARGET_RATIO:
+        if x2 - x1 > 75:
+            reasons.append("subject fills frame width")
+    else:
+        if y2 - y1 > 75:
+            reasons.append("subject fills frame height")
+    return "; ".join(reasons) or None
 
 
 def recrop_image(
@@ -258,7 +301,7 @@ def recrop_image(
     with Image.open(image_path) as img:
         img = ImageOps.exif_transpose(img)
         w, h = img.size
-        box = compute_crop_box(w, h, fx, fy)
+        box, _ = compute_crop_box(w, h, fx, fy)
         if not dry_run:
             cropped = img.crop(box)
             out = Path(output_path)
@@ -320,18 +363,27 @@ def _fit_with_quality(
     return best_data, best_q
 
 
-def save_compressed(img: Image.Image, output_path: Path, suffix: str, log: LogFn = print) -> None:
+def save_compressed(
+    img: Image.Image, output_path: Path, suffix: str, log: LogFn = print
+) -> tuple[int, Optional[int]]:
+    """Save img compressed to fit within MAX_FILE_BYTES.
+
+    Returns (size_bytes, quality) where quality is None for lossless formats.
+    quality=95 means no lossy reduction was needed; lower values were applied to meet the limit.
+    """
     ext = suffix.lower()
 
     if ext in {".jpg", ".jpeg"}:
         data, quality = _fit_with_quality(img, "JPEG", {"subsampling": 0}, log=log)
         output_path.write_bytes(data)
         log(f"  Compressed to {len(data) / 1024 / 1024:.1f} MB (JPEG, quality {quality})")
+        return len(data), quality
 
     elif ext == ".webp":
         data, quality = _fit_with_quality(img, "WEBP", {}, log=log)
         output_path.write_bytes(data)
         log(f"  Compressed to {len(data) / 1024 / 1024:.1f} MB (WebP, quality {quality})")
+        return len(data), quality
 
     elif ext == ".png":
         data = _encode(img, "PNG", compress_level=9)
@@ -339,6 +391,7 @@ def save_compressed(img: Image.Image, output_path: Path, suffix: str, log: LogFn
             data = _downscale_to_fit(img, "PNG", {"compress_level": 9}, log=log)
         output_path.write_bytes(data)
         log(f"  Compressed to {len(data) / 1024 / 1024:.1f} MB (PNG)")
+        return len(data), None
 
     else:
         img.save(output_path)
@@ -348,6 +401,7 @@ def save_compressed(img: Image.Image, output_path: Path, suffix: str, log: LogFn
             log(f"  Saved at {label} (warning: exceeds 24 MB — this format can't be compressed further)")
         else:
             log(f"  Saved at {label}")
+        return size, None
 
 
 def process_image(
@@ -369,30 +423,36 @@ def process_image(
     log(f"\n{header}")
 
     log("  Analyzing with Claude to find the subject…")
-    fx, fy, subject = get_focal_point(client, image_path, model)
-    log(f"  Subject: {subject} — target at {fx:.0f}% across, {fy:.0f}% down")
+    fx, fy, subject, confidence, focal_box = get_focal_point(client, image_path, model)
+    log(f"  Subject: {subject} — target at {fx:.0f}% across, {fy:.0f}% down (confidence: {confidence})")
 
     with Image.open(image_path) as img:
         img = ImageOps.exif_transpose(img)
         w, h = img.size
-        box = compute_crop_box(w, h, fx, fy)
+        box, clamped = compute_crop_box(w, h, fx, fy)
         crop_w, crop_h = box[2] - box[0], box[3] - box[1]
+        warning = _crop_quality_warning(confidence, clamped, focal_box, w, h)
+        if warning:
+            log(f"  ⚠ Crop quality note: {warning}")
 
         if dry_run:
             log(f"  Would crop {w}×{h} → {crop_w}×{crop_h} (16:9) — dry run, nothing written")
             return CropResult(path=str(image_path), status="dry_run", width=w, height=h,
                               focal=(fx, fy), box=box, output_path=str(output_path),
-                              subject=subject)
+                              subject=subject, confidence=confidence, focal_box=focal_box,
+                              crop_warning=warning)
 
         log(f"  Cropping {w}×{h} → {crop_w}×{crop_h} (16:9)")
         cropped = img.crop(box)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    save_compressed(cropped, output_path, image_path.suffix, log=log)
+    size_bytes, quality = save_compressed(cropped, output_path, image_path.suffix, log=log)
     log(f"  ✓ Saved as {output_path.name}")
     return CropResult(path=str(image_path), status="cropped", width=w, height=h,
                       focal=(fx, fy), box=box, output_path=str(output_path),
-                      subject=subject)
+                      subject=subject, confidence=confidence, focal_box=focal_box,
+                      output_size_bytes=size_bytes, compression_quality=quality,
+                      crop_warning=warning)
 
 
 # ---------------------------------------------------------------------------

@@ -106,6 +106,7 @@ class CropResult:
     output_size_bytes: Optional[int] = None
     compression_quality: Optional[int] = None          # None = no lossy compression applied
     crop_warning: Optional[str] = None                 # set when crop quality may be poor
+    model: Optional[str] = None                        # model used to detect the focal point
 
 
 ResultFn = Callable[["CropResult"], None]
@@ -440,7 +441,7 @@ def process_image(
             return CropResult(path=str(image_path), status="dry_run", width=w, height=h,
                               focal=(fx, fy), box=box, output_path=str(output_path),
                               subject=subject, confidence=confidence, focal_box=focal_box,
-                              crop_warning=warning)
+                              crop_warning=warning, model=model)
 
         log(f"  Cropping {w}×{h} → {crop_w}×{crop_h} (16:9)")
         cropped = img.crop(box)
@@ -452,7 +453,7 @@ def process_image(
                       focal=(fx, fy), box=box, output_path=str(output_path),
                       subject=subject, confidence=confidence, focal_box=focal_box,
                       output_size_bytes=size_bytes, compression_quality=quality,
-                      crop_warning=warning)
+                      crop_warning=warning, model=model)
 
 
 # ---------------------------------------------------------------------------

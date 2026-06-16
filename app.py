@@ -12,8 +12,9 @@ import sys
 import threading
 import tkinter as tk
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 
 try:
     import keyring
@@ -39,6 +40,9 @@ _SETTINGS_DIR = (
     else Path.home() / ".skylight_cropping"
 )
 SETTINGS_FILE = _SETTINGS_DIR / "settings.json"
+# One JSON object per line — a running log of detections the user flagged as
+# bad, for reviewing prompt/model quality over time. See record_flag().
+FLAGGED_FILE = _SETTINGS_DIR / "flagged_detections.jsonl"
 DEFAULT_TO = ""  # set your Skylight frame's email address in the app Settings
 
 _KEYRING_SERVICE = "SkylightCropping"
@@ -165,6 +169,26 @@ def save_settings(settings: dict) -> None:
             to_save[key] = value  # keyring unavailable — keep in plaintext as fallback
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     SETTINGS_FILE.write_text(json.dumps(to_save, indent=2), encoding="utf-8")
+
+
+def record_flag(result: CropResult, note: str = "", flag_file: Path = FLAGGED_FILE) -> None:
+    """Append a flagged-detection record so prompt/model quality can be
+    reviewed across a batch of photos later."""
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "file": Path(result.path).name,
+        "path": result.path,
+        "model": result.model,
+        "subject": result.subject,
+        "confidence": result.confidence,
+        "focal": result.focal,
+        "focal_box": result.focal_box,
+        "crop_warning": result.crop_warning,
+        "note": note,
+    }
+    flag_file.parent.mkdir(parents=True, exist_ok=True)
+    with flag_file.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +449,7 @@ class App(ctk.CTk):
     def _primary(self, parent, text, command, height=44, width=None):
         kw = dict(text=text, command=command, height=height, font=self.f_button,
                   fg_color=ACCENT, hover_color=ACCENT_HV, text_color=ACCENT_INK,
-                  corner_radius=8)
+                  text_color_disabled=ACCENT_INK, corner_radius=8)
         if width:
             kw["width"] = width
         return ctk.CTkButton(parent, **kw)
@@ -471,6 +495,11 @@ class App(ctk.CTk):
         self.canvas.pack(fill="both", expand=True, padx=8, pady=8)
         self.canvas.bind("<Configure>", self._on_canvas_resize)
         self.canvas.bind("<Button-1>", self._on_preview_click)
+
+        self.flag_btn = self._ghost(pv, "🚩 Flag detection", self._flag_current,
+                                    width=150, height=28)
+        self.flag_btn.configure(state="disabled")
+        self.flag_btn.place(relx=1.0, x=-18, y=18, anchor="ne")
 
         opt = ctk.CTkFrame(left, fg_color=PANEL, corner_radius=10,
                            border_width=1, border_color=STROKE)
@@ -687,6 +716,9 @@ class App(ctk.CTk):
         return self._preview_cache[path]
 
     def _render_preview(self, item):
+        result = item.get("result") if item else None
+        self.flag_btn.configure(state="normal" if result and result.box else "disabled")
+
         c = self.canvas
         w, h = c.winfo_width(), c.winfo_height()
         if w < 20 or h < 20:
@@ -713,7 +745,6 @@ class App(ctk.CTk):
         self._tk_preview = ImageTk.PhotoImage(disp)
         c.create_image(ox, oy, anchor="nw", image=self._tk_preview)
 
-        result = item.get("result")
         if result and result.box:
             l, u, r, b = result.box
             x1, y1 = ox + l * scale, oy + u * scale
@@ -827,6 +858,7 @@ class App(ctk.CTk):
             confidence=result.confidence,
             focal_box=result.focal_box,
             crop_warning=result.crop_warning,
+            model=result.model,
         )
         self._render_preview(item)
         # Re-save in background (skip if dry run or no output path)
@@ -841,6 +873,22 @@ class App(ctk.CTk):
             threading.Thread(target=_worker, daemon=True).start()
         elif result.status == "dry_run":
             self._log(f"Target moved to ({fx:.0f}%, {fy:.0f}%) — dry run, no file written")
+
+    def _flag_current(self):
+        """Log the current photo's detection as bad, for later prompt/model review."""
+        item = self.item_by_path.get(self.current_path) if self.current_path else None
+        result = item.get("result") if item else None
+        if not result or not result.box:
+            return
+        note = simpledialog.askstring(
+            "Flag bad detection",
+            "What's wrong with this crop? (optional)",
+            parent=self)
+        if note is None:
+            return  # cancelled
+        record_flag(result, note, flag_file=FLAGGED_FILE)
+        name = Path(result.path).name
+        self._log(f"🚩 Flagged {name}" + (f": {note}" if note else ""))
 
     def _draw_placeholder(self, w, h, text):
         c = self.canvas
@@ -1181,8 +1229,10 @@ class App(ctk.CTk):
     def _set_busy(self, busy: bool, status: str = "Ready"):
         self._running = busy
         state = "disabled" if busy else "normal"
-        self.crop_btn.configure(state=state)
-        self.send_btn.configure(state=state)
+        self.crop_btn.configure(
+            state=state, text="Cropping…" if busy else "Crop Photos")
+        self.send_btn.configure(
+            state=state, text="Sending…" if busy else "Send Photos")
         self.status_label.configure(text=status, text_color=ACCENT if busy else MUTED)
 
     # =======================================================================

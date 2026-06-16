@@ -25,11 +25,15 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Callable
 
 import anthropic
 from PIL import Image, ImageDraw, ImageOps
 
 from smart_crop import FOCAL_POINT_PROMPT, collect_images, encode_image
+
+LogFn = Callable[[str], None]
+ProgressFn = Callable[[int, int], None]  # (completed, total)
 
 # Add alternate wordings here to test them against the current production
 # prompt. Keys become the labels shown on each comparison image.
@@ -155,6 +159,56 @@ def make_thumb(image_path: Path, max_px: int = 640) -> Image.Image:
         return img
 
 
+def run_prompt_eval(
+    images: list[Path],
+    variant_names: list[str],
+    model: str,
+    api_key: str,
+    out_dir: Path,
+    log_fn: LogFn = print,
+    progress_fn: ProgressFn = lambda done, total: None,
+) -> list[Path]:
+    """Run each named variant against each image, one API call per pair.
+
+    Writes one side-by-side comparison JPEG per image to out_dir (panels
+    labeled with variant name, detected subject, and confidence) and returns
+    the list of output paths.
+    """
+    client = anthropic.Anthropic(api_key=api_key)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    outputs = []
+
+    for i, img_path in enumerate(images, start=1):
+        log_fn(f"\n{img_path.name}")
+        panels = []
+        for name in variant_names:
+            thumb = make_thumb(img_path)
+            try:
+                data = ask_claude(client, img_path, model, PROMPT_VARIANTS[name])
+                box = (float(data["x1"]), float(data["y1"]), float(data["x2"]), float(data["y2"]))
+                label = f"{name}: {data.get('subject', '?')} (conf {data.get('confidence', '?')})"
+                log_fn(f"  {label}  box={box}")
+                panels.append(draw_box(thumb, box, label))
+            except Exception as exc:
+                log_fn(f"  {name}: FAILED ({exc})")
+                panels.append(draw_box(thumb, (0, 0, 0, 0), f"{name}: ERROR"))
+
+        total_w = sum(p.width for p in panels)
+        max_h = max(p.height for p in panels)
+        composite = Image.new("RGB", (total_w, max_h), "white")
+        x = 0
+        for p in panels:
+            composite.paste(p, (x, 0))
+            x += p.width
+        out_path = out_dir / f"{img_path.stem}_compare.jpg"
+        composite.save(out_path, quality=90)
+        log_fn(f"  -> {out_path}")
+        outputs.append(out_path)
+        progress_fn(i, len(images))
+
+    return outputs
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("inputs", nargs="+", help="Test image files or a directory of them.")
@@ -183,36 +237,8 @@ def main() -> None:
     if not args.yes and input("Proceed? [y/N] ").strip().lower() != "y":
         sys.exit("Aborted.")
 
-    client = anthropic.Anthropic(api_key=api_key)
     out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    for img_path in images:
-        print(f"\n{img_path.name}")
-        panels = []
-        for name in variant_names:
-            thumb = make_thumb(img_path)
-            try:
-                data = ask_claude(client, img_path, args.model, PROMPT_VARIANTS[name])
-                box = (float(data["x1"]), float(data["y1"]), float(data["x2"]), float(data["y2"]))
-                label = f"{name}: {data.get('subject', '?')} (conf {data.get('confidence', '?')})"
-                print(f"  {label}  box={box}")
-                panels.append(draw_box(thumb, box, label))
-            except Exception as exc:
-                print(f"  {name}: FAILED ({exc})")
-                panels.append(draw_box(thumb, (0, 0, 0, 0), f"{name}: ERROR"))
-
-        total_w = sum(p.width for p in panels)
-        max_h = max(p.height for p in panels)
-        composite = Image.new("RGB", (total_w, max_h), "white")
-        x = 0
-        for p in panels:
-            composite.paste(p, (x, 0))
-            x += p.width
-        out_path = out_dir / f"{img_path.stem}_compare.jpg"
-        composite.save(out_path, quality=90)
-        print(f"  -> {out_path}")
-
+    run_prompt_eval(images, variant_names, args.model, api_key, out_dir, log_fn=print)
     print(f"\nDone. Open {out_dir}/ and compare each *_compare.jpg side by side.")
 
 

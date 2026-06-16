@@ -46,11 +46,16 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
+      - name: Install Tk + virtual display
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk xvfb
+
       - name: Install dependencies
         run: pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Run tests
-        run: pytest tests/ -v
+        run: xvfb-run -a pytest tests/ -v
 
   build-windows:
     needs: [lint, test]

@@ -97,6 +97,15 @@ class App(ctk.CTk):
         self.minsize(1040, 780)
         self.configure(fg_color=BG)
 
+        _icon_png = Path(__file__).parent / "assets" / "icon.png"
+        _icon_ico = Path(__file__).parent / "assets" / "icon.ico"
+        if sys.platform == "win32" and _icon_ico.exists():
+            self.iconbitmap(str(_icon_ico))
+        elif _icon_png.exists():
+            _icon_img = ImageTk.PhotoImage(Image.open(_icon_png).resize((256, 256), Image.LANCZOS))
+            self.iconphoto(True, _icon_img)
+            self._app_icon = _icon_img  # prevent GC
+
         self.settings = load_settings()
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.progress_queue: queue.Queue[tuple[int, int]] = queue.Queue()

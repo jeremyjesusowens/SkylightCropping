@@ -26,11 +26,12 @@ import os
 import smtplib
 import sys
 import time
+from dataclasses import dataclass
 from email import encoders
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
 import anthropic
 from PIL import Image, ImageOps
@@ -52,24 +53,81 @@ MEDIA_TYPES = {
 }
 
 FOCAL_POINT_PROMPT = (
-    "Identify the single most important subject or focal point of this photo. "
-    "Return ONLY a JSON object: "
-    '{"x": <0-100>, "y": <0-100>} '
-    "where x is the horizontal position (0=left edge, 100=right edge) and "
-    "y is the vertical position (0=top edge, 100=bottom edge) of that focal point, "
-    "expressed as a percentage of the image dimensions. "
-    "No explanation or extra text — just the JSON."
+    "Look at this photo and follow these steps:\n\n"
+    "Step 1 — Identify the PRIMARY SUBJECT: the single animal, person, or object "
+    "the viewer's eye is drawn to first.\n\n"
+    "Step 2 — Draw an imaginary tight bounding box around that subject's PRIMARY BODY MASS only. "
+    "Deliberately EXCLUDE extremities that extend far from the body: "
+    "do NOT include beaks, bills, tails, wingtips, outstretched legs, feet, antlers, "
+    "fins, or any thin appendage that projects away from the torso. "
+    "Only the core torso (and head when it is close to the torso).\n\n"
+    "Step 3 — Return ONLY a JSON object with no explanation:\n"
+    '{"subject": "<brief description e.g. alligator, great blue heron>", '
+    '"x1": <left edge of box, 0-100>, "y1": <top edge of box, 0-100>, '
+    '"x2": <right edge of box, 0-100>, "y2": <bottom edge of box, 0-100>}\n\n'
+    "All values are percentages: 0 = left/top edge of image, 100 = right/bottom edge."
 )
 
-DEFAULT_TO = "your-skylight-frame@example.com"
+DEFAULT_TO = ""  # set your Skylight frame's email address in the app Settings
 DEFAULT_SMTP_HOST = "smtp.mail.yahoo.com"
 DEFAULT_SMTP_PORT = 587
 
 LogFn = Callable[[str], None]
+ProgressFn = Callable[[int, int], None]  # (completed, total)
+
+
+@dataclass
+class CropResult:
+    """Structured per-image outcome, surfaced to callers (e.g. the GUI preview).
+
+    Coordinates are in the original, EXIF-corrected image's pixel space.
+    """
+    path: str
+    status: str  # "analyzing" | "cropped" | "dry_run" | "failed"
+    width: Optional[int] = None
+    height: Optional[int] = None
+    focal: Optional[tuple[float, float]] = None        # (x_pct, y_pct) in [0,100]
+    box: Optional[tuple[int, int, int, int]] = None    # (left, upper, right, lower)
+    output_path: Optional[str] = None
+    error: Optional[str] = None
+    subject: Optional[str] = None                      # e.g. "alligator", "great blue heron"
+
+
+ResultFn = Callable[["CropResult"], None]
+
+
+def _noop_result(result: "CropResult") -> None:
+    pass
+
+# Used when no model list can be fetched from the API.
+FALLBACK_MODELS = [
+    "claude-opus-4-7",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001",
+]
+
+
+def _noop_progress(completed: int, total: int) -> None:
+    pass
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+def list_models(api_key: str) -> list[str]:
+    """
+    Return available Claude model IDs from the Anthropic API, newest first.
+    Falls back to a built-in list if the request fails so the UI always has
+    something to show.
+    """
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        ids = [m.id for m in client.models.list(limit=100) if m.id.startswith("claude-")]
+        return ids or list(FALLBACK_MODELS)
+    except Exception:
+        return list(FALLBACK_MODELS)
+
 
 def collect_images(inputs: list[str], log: LogFn = print) -> list[Path]:
     paths: list[Path] = []
@@ -120,12 +178,18 @@ def encode_image(path: Path) -> tuple[str, str]:
     return data, "image/jpeg"
 
 
-def get_focal_point(client: anthropic.Anthropic, image_path: Path, model: str) -> tuple[float, float]:
-    """Ask Claude where the main subject is. Returns (x_pct, y_pct) in [0, 100]."""
+def get_focal_point(
+    client: anthropic.Anthropic, image_path: Path, model: str
+) -> tuple[float, float, str]:
+    """Ask Claude where the main subject is.
+
+    Returns (x_pct, y_pct, subject_description) where x/y are in [0, 100].
+    Claude returns a bounding box; we compute the centre as the target point.
+    """
     data, media_type = encode_image(image_path)
     response = client.messages.create(
         model=model,
-        max_tokens=128,
+        max_tokens=256,
         messages=[
             {
                 "role": "user",
@@ -151,10 +215,16 @@ def get_focal_point(client: anthropic.Anthropic, image_path: Path, model: str) -
     start, end = text.find("{"), text.rfind("}") + 1
     if start == -1 or end == 0:
         raise ValueError(f"No JSON in response: {text!r}")
-    result = json.loads(text[start:end])
-    x = max(0.0, min(100.0, float(result["x"])))
-    y = max(0.0, min(100.0, float(result["y"])))
-    return x, y
+    data_parsed = json.loads(text[start:end])
+    subject = str(data_parsed.get("subject", "subject"))
+    # Derive centre from bounding box corners
+    x1 = float(data_parsed["x1"])
+    y1 = float(data_parsed["y1"])
+    x2 = float(data_parsed["x2"])
+    y2 = float(data_parsed["y2"])
+    x = max(0.0, min(100.0, (x1 + x2) / 2))
+    y = max(0.0, min(100.0, (y1 + y2) / 2))
+    return x, y, subject
 
 
 def compute_crop_box(img_w: int, img_h: int, fx_pct: float, fy_pct: float) -> tuple[int, int, int, int]:
@@ -172,6 +242,38 @@ def compute_crop_box(img_w: int, img_h: int, fx_pct: float, fy_pct: float) -> tu
         top = round(fy - crop_h / 2)
         top = max(0, min(top, img_h - crop_h))
         return 0, top, img_w, top + crop_h
+
+
+def recrop_image(
+    image_path: str,
+    output_path: str,
+    fx: float,
+    fy: float,
+    dry_run: bool = False,
+    subject: Optional[str] = None,
+) -> CropResult:
+    """Re-crop with a user-adjusted target point without calling the API."""
+    with Image.open(image_path) as img:
+        img = ImageOps.exif_transpose(img)
+        w, h = img.size
+        box = compute_crop_box(w, h, fx, fy)
+        if not dry_run:
+            cropped = img.crop(box)
+            out = Path(output_path)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            suffix = Path(image_path).suffix.lower()
+            save_kwargs: dict = {}
+            if suffix in (".jpg", ".jpeg"):
+                save_kwargs = {"quality": 95, "optimize": True}
+            cropped.save(out, **save_kwargs)
+    return CropResult(
+        path=image_path,
+        status="dry_run" if dry_run else "cropped",
+        width=w, height=h,
+        focal=(fx, fy), box=box,
+        output_path=output_path,
+        subject=subject,
+    )
 
 
 def _encode(img: Image.Image, fmt: str, **kwargs) -> bytes:
@@ -222,28 +324,28 @@ def save_compressed(img: Image.Image, output_path: Path, suffix: str, log: LogFn
     if ext in {".jpg", ".jpeg"}:
         data, quality = _fit_with_quality(img, "JPEG", {"subsampling": 0}, log=log)
         output_path.write_bytes(data)
-        log(f"  JPEG quality: {quality}  |  {len(data) / 1024 / 1024:.1f} MB")
+        log(f"  Compressed to {len(data) / 1024 / 1024:.1f} MB (JPEG, quality {quality})")
 
     elif ext == ".webp":
         data, quality = _fit_with_quality(img, "WEBP", {}, log=log)
         output_path.write_bytes(data)
-        log(f"  WebP quality: {quality}  |  {len(data) / 1024 / 1024:.1f} MB")
+        log(f"  Compressed to {len(data) / 1024 / 1024:.1f} MB (WebP, quality {quality})")
 
     elif ext == ".png":
         data = _encode(img, "PNG", compress_level=9)
         if len(data) > MAX_FILE_BYTES:
             data = _downscale_to_fit(img, "PNG", {"compress_level": 9}, log=log)
         output_path.write_bytes(data)
-        log(f"  PNG  |  {len(data) / 1024 / 1024:.1f} MB")
+        log(f"  Compressed to {len(data) / 1024 / 1024:.1f} MB (PNG)")
 
     else:
         img.save(output_path)
         size = output_path.stat().st_size
         label = f"{size / 1024 / 1024:.1f} MB"
         if size > MAX_FILE_BYTES:
-            log(f"  {label}  (warning: exceeds 24 MB — format does not support lossy compression)")
+            log(f"  Saved at {label} (warning: exceeds 24 MB — this format can't be compressed further)")
         else:
-            log(f"  {label}")
+            log(f"  Saved at {label}")
 
 
 def process_image(
@@ -253,12 +355,20 @@ def process_image(
     model: str,
     dry_run: bool,
     log: LogFn = print,
-) -> None:
-    """Crop a single image. Raises on any failure — no silent fallbacks."""
-    log(f"\n{image_path.name}")
+    index: int | None = None,
+    total: int | None = None,
+) -> CropResult:
+    """Crop a single image. Raises on any failure — no silent fallbacks.
 
-    fx, fy = get_focal_point(client, image_path, model)
-    log(f"  Focal point: ({fx:.1f}%, {fy:.1f}%)")
+    Returns a CropResult describing the focal point and 16:9 box (in the
+    original image's pixel space) so callers can preview the crop.
+    """
+    header = f"[{index}/{total}] {image_path.name}" if index and total else image_path.name
+    log(f"\n{header}")
+
+    log("  Analyzing with Claude to find the subject…")
+    fx, fy, subject = get_focal_point(client, image_path, model)
+    log(f"  Subject: {subject} — target at {fx:.0f}% across, {fy:.0f}% down")
 
     with Image.open(image_path) as img:
         img = ImageOps.exif_transpose(img)
@@ -267,15 +377,20 @@ def process_image(
         crop_w, crop_h = box[2] - box[0], box[3] - box[1]
 
         if dry_run:
-            log(f"  Source:   {w}x{h}")
-            log(f"  Crop box: {box}  →  {crop_w}x{crop_h}")
-            return
+            log(f"  Would crop {w}×{h} → {crop_w}×{crop_h} (16:9) — dry run, nothing written")
+            return CropResult(path=str(image_path), status="dry_run", width=w, height=h,
+                              focal=(fx, fy), box=box, output_path=str(output_path),
+                              subject=subject)
 
+        log(f"  Cropping {w}×{h} → {crop_w}×{crop_h} (16:9)")
         cropped = img.crop(box)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     save_compressed(cropped, output_path, image_path.suffix, log=log)
-    log(f"  Saved: {output_path.name}  ({crop_w}x{crop_h})")
+    log(f"  ✓ Saved as {output_path.name}")
+    return CropResult(path=str(image_path), status="cropped", width=w, height=h,
+                      focal=(fx, fy), box=box, output_path=str(output_path),
+                      subject=subject)
 
 
 # ---------------------------------------------------------------------------
@@ -290,33 +405,49 @@ def run_crop(
     dry_run: bool,
     api_key: str,
     log_fn: LogFn = print,
+    progress_fn: ProgressFn = _noop_progress,
+    result_fn: ResultFn = _noop_result,
 ) -> tuple[list[tuple[str, str]], int]:
     """
     Crop images to 16:9. Returns (failures, total) where failures is a list
     of (filename, error_message) tuples for images that could not be cropped.
+
+    result_fn is called with a CropResult as each image is processed: once with
+    status="analyzing" when it starts, then with the final outcome ("cropped",
+    "dry_run", or "failed"). This lets a UI preview each crop as the batch runs.
     """
     client = anthropic.Anthropic(api_key=api_key)
     images = collect_images(inputs, log=log_fn)
     if not images:
         log_fn("No supported images found.")
+        progress_fn(0, 0)
         return [], 0
 
-    log_fn(f"Processing {len(images)} image(s) with {model}...")
+    total = len(images)
+    mode = " — dry run" if dry_run else ""
+    log_fn(f"Cropping {total} photo(s) with {model}{mode}")
+    progress_fn(0, total)
     failures: list[tuple[str, str]] = []
 
-    for img_path in images:
+    for i, img_path in enumerate(images, start=1):
         out_path = (
             Path(output_dir) / (img_path.stem + suffix + img_path.suffix)
             if output_dir
             else img_path.parent / (img_path.stem + suffix + img_path.suffix)
         )
+        result_fn(CropResult(path=str(img_path), status="analyzing"))
         try:
-            process_image(client, img_path, out_path, model, dry_run, log=log_fn)
+            result = process_image(client, img_path, out_path, model, dry_run,
+                                   log=log_fn, index=i, total=total)
         except Exception as exc:
-            log_fn(f"  ERROR: {exc}")
+            log_fn(f"  ✗ Failed: {exc}")
             failures.append((img_path.name, str(exc)))
+            result_fn(CropResult(path=str(img_path), status="failed", error=str(exc)))
+        else:
+            result_fn(result)
+        progress_fn(i, total)
 
-    return failures, len(images)
+    return failures, total
 
 
 def _send_one(
@@ -345,8 +476,9 @@ def _send_one(
                 server.starttls()
                 server.ehlo()
                 server.login(from_addr, password)
+                log_fn(f"  Connecting to mail server and sending ({size_mb:.1f} MB)…")
                 server.sendmail(from_addr, [to_addr], _build_email(from_addr, to_addr, img_path).as_bytes())
-            log_fn(f"  Sent ({size_mb:.1f} MB)")
+            log_fn("  ✓ Sent")
             return None
 
         except smtplib.SMTPAuthenticationError:
@@ -354,8 +486,8 @@ def _send_one(
 
         except (smtplib.SMTPException, ConnectionRefusedError, OSError) as exc:
             if attempt < max_retries - 1:
-                log_fn(f"  Error: {exc}")
-                log_fn(f"  Rate limited — waiting {retry_delay}s before retry {attempt + 2}/{max_retries}...")
+                log_fn(f"  Hit a problem: {exc}")
+                log_fn(f"  Waiting {retry_delay}s before retry {attempt + 2} of {max_retries}…")
                 # Log countdown every 15 s so the UI doesn't look frozen
                 for remaining in range(retry_delay, 0, -15):
                     time.sleep(min(15, remaining))
@@ -377,6 +509,7 @@ def run_send(
     log_fn: LogFn = print,
     max_retries: int = 3,
     retry_delay: int = 90,
+    progress_fn: ProgressFn = _noop_progress,
 ) -> tuple[list[tuple[str, str]], int]:
     """
     Email each photo in directory as an individual attachment.
@@ -388,6 +521,7 @@ def run_send(
     images = collect_images([directory], log=log_fn)
     if not images:
         log_fn("No supported images found.")
+        progress_fn(0, 0)
         return [], 0
 
     total = len(images)
@@ -395,20 +529,20 @@ def run_send(
         f"Sending {total} photo(s)\n"
         f"  From: {from_addr}\n"
         f"  To:   {to_addr}\n"
-        f"  SMTP: {smtp_host}:{smtp_port}\n"
-        f"  Retries: {max_retries}  Delay: {retry_delay}s"
+        f"  Via:  {smtp_host}:{smtp_port}  (up to {max_retries} tries each)"
     )
+    progress_fn(0, total)
     failures: list[tuple[str, str]] = []
 
-    for i, img_path in enumerate(images):
-        log_fn(f"\n{img_path.name}")
+    for i, img_path in enumerate(images, start=1):
+        log_fn(f"\n[{i}/{total}] {img_path.name}")
         try:
             error = _send_one(
                 img_path, from_addr, to_addr, smtp_host, smtp_port,
                 password, log_fn, max_retries, retry_delay,
             )
             if error:
-                log_fn(f"  Failed after {max_retries} attempt(s): {error}")
+                log_fn(f"  ✗ Gave up after {max_retries} attempt(s): {error}")
                 failures.append((img_path.name, error))
 
         except smtplib.SMTPAuthenticationError:
@@ -417,8 +551,9 @@ def run_send(
                 "For Yahoo Mail, use an App Password, not your account password.\n"
                 "Generate one at: myaccount.yahoo.com → Security → App passwords"
             )
-            failures.extend((img.name, "Authentication failed") for img in images[i:])
+            failures.extend((img.name, "Authentication failed") for img in images[i - 1:])
             break
+        progress_fn(i, total)
 
     return failures, total
 

@@ -1217,8 +1217,17 @@ class App(ctk.CTk):
                         fg_color=PANEL2, corner_radius=10, padx=10, pady=3).pack(
                 side="left", padx=(0, 6))
 
+        if result.categories:
+            cat_row = ctk.CTkFrame(info, fg_color="transparent")
+            cat_row.grid(row=3, column=0, sticky="w", pady=(6, 0))
+            for cat in result.categories:
+                cat_color = TIER_COLORS[score_tier(cat["score"])]
+                ctk.CTkLabel(cat_row, text=f'{cat["name"]} {cat["score"]}',
+                            font=self.f_small, text_color=cat_color).pack(
+                    side="left", padx=(0, 12))
+
         self._ghost(info, "Full Review →", lambda p=path: self._open_rate_detail(p),
-                   width=140, height=26).grid(row=3, column=0, sticky="w", pady=(8, 0))
+                   width=140, height=26).grid(row=4, column=0, sticky="w", pady=(8, 0))
 
         ring = tk.Canvas(card, width=72, height=72, bg=PANEL, highlightthickness=0)
         ring.grid(row=0, column=2, rowspan=2, padx=14, pady=14)

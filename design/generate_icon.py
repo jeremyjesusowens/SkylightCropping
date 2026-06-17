@@ -82,10 +82,15 @@ if __name__ == "__main__":
     ico_sizes = [256, 128, 64, 48, 32, 16]
     frames = [create_icon(s) for s in ico_sizes]
     ico_path = OUT / "icon.ico"
+    # bitmap_format="bmp" forces classic uncompressed DIB icon entries —
+    # Tk's wm iconbitmap on Windows can't read the PNG-compressed entries
+    # Pillow writes by default, so the window/taskbar icon silently stays
+    # at its previous value if we don't force this.
     frames[0].save(
         ico_path, format="ICO",
         sizes=[(s, s) for s in ico_sizes],
         append_images=frames[1:],
+        bitmap_format="bmp",
     )
     print(f"wrote {ico_path}")
     print("done")

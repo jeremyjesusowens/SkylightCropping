@@ -121,6 +121,8 @@ THUMB     = "#1b1d2e"   # thumbnail placeholder
 SEL       = "#1d2030"   # selected row
 HOVER     = "#191b2a"   # subtle hover
 
+SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
 PREVIEW_MAX_PX = 1600    # cap for the in-app preview copy (display only)
 THUMB_SIZE = (58, 34)    # queue-row thumbnail size
 
@@ -238,6 +240,10 @@ class App(ctk.CTk):
         self.progress_queue: queue.Queue[tuple[int, int]] = queue.Queue()
         self.result_queue: queue.Queue = queue.Queue()
         self._running = False
+        self._spinner_btn = None
+        self._spinner_job = None
+        self._spinner_frame = 0
+        self._busy_restore_text = None
 
         # Queue model: ordered list of item dicts; lookup by path.
         self.items: list[dict] = []
@@ -472,7 +478,7 @@ class App(ctk.CTk):
     def _primary(self, parent, text, command, height=44, width=None):
         kw = dict(text=text, command=command, height=height, font=self.f_button,
                   fg_color=ACCENT, hover_color=ACCENT_HV, text_color=ACCENT_INK,
-                  corner_radius=8)
+                  text_color_disabled=ACCENT_INK, corner_radius=8)
         if width:
             kw["width"] = width
         return ctk.CTkButton(parent, **kw)
@@ -481,6 +487,7 @@ class App(ctk.CTk):
         return ctk.CTkButton(parent, text=text, command=command, width=width,
                              height=height, font=self.f_button,
                              fg_color=PANEL2, hover_color=HOVER, text_color=TXT,
+                             text_color_disabled=DIM,
                              border_width=1, border_color=STROKE, corner_radius=7)
 
     def _card(self, parent, title: str) -> ctk.CTkFrame:
@@ -585,9 +592,12 @@ class App(ctk.CTk):
 
         btns = ctk.CTkFrame(right, fg_color="transparent")
         btns.pack(fill="x", padx=16, pady=(0, 8))
-        self._ghost(btns, "Add Files", self._add_crop_files, width=98).pack(side="left", padx=(0, 6))
-        self._ghost(btns, "Add Folder", self._add_crop_folder, width=104).pack(side="left", padx=(0, 6))
-        self._ghost(btns, "Clear", self._clear_crop_files, width=62).pack(side="left")
+        self.add_files_btn = self._ghost(btns, "Add Files", self._add_crop_files, width=98)
+        self.add_files_btn.pack(side="left", padx=(0, 6))
+        self.add_folder_btn = self._ghost(btns, "Add Folder", self._add_crop_folder, width=104)
+        self.add_folder_btn.pack(side="left", padx=(0, 6))
+        self.clear_queue_btn = self._ghost(btns, "Clear", self._clear_crop_files, width=62)
+        self.clear_queue_btn.pack(side="left")
 
         self.queue_list = ctk.CTkScrollableFrame(right, fg_color="transparent")
         self.queue_list.pack(fill="both", expand=True, padx=8, pady=(0, 10))
@@ -1095,7 +1105,8 @@ class App(ctk.CTk):
         out_dir = Path(__file__).parent / "eval_out"
         self.progress.set(0)
         self.progress_count.configure(text=f"0 / {len(images)}")
-        self._set_busy(True, "Testing prompts…")
+        self._set_busy(True, "Testing prompts…", op_btn=self.prompt_eval_btn,
+                       op_label="Testing", op_restore="Run Prompt Test")
         self._log(f"\n═══ Prompt test: {len(images)} photo(s) × {variant_names} on {model} ═══")
 
         def worker():
@@ -1346,13 +1357,53 @@ class App(ctk.CTk):
             if result.path == self.current_path:
                 self._render_preview(item)
 
-    def _set_busy(self, busy: bool, status: str = "Ready"):
+    def _set_busy(self, busy: bool, status: str = "Ready",
+                  op_btn=None, op_label: str = "", op_restore: str = ""):
         self._running = busy
         state = "disabled" if busy else "normal"
-        self.crop_btn.configure(state=state)
-        self.send_btn.configure(state=state)
-        self.prompt_eval_btn.configure(state=state)
+
+        # The button driving the current operation stays fully lit and
+        # gains an animated spinner; the other action buttons just dim
+        # to a quiet, clearly-inactive look instead of CTk's default
+        # low-contrast grey-on-violet text.
+        for btn in (self.crop_btn, self.send_btn, self.prompt_eval_btn):
+            if busy and btn is op_btn:
+                btn.configure(state=state)  # disabled, but keeps full styling + spinner
+            else:
+                btn.configure(state=state, fg_color=PANEL2 if busy else ACCENT,
+                              text_color_disabled=DIM if busy else ACCENT_INK)
+        for btn in (self.add_files_btn, self.add_folder_btn, self.clear_queue_btn):
+            btn.configure(state=state)
+
         self.status_label.configure(text=status, text_color=ACCENT if busy else MUTED)
+
+        if busy and op_btn is not None:
+            self._start_spinner(op_btn, op_label, op_restore)
+        else:
+            self._stop_spinner()
+
+    def _start_spinner(self, button, label: str, restore_text: str):
+        self._busy_restore_text = restore_text
+        self._spinner_btn = button
+        self._spinner_frame = 0
+        self._spinner_label = label
+        self._spin_tick()
+
+    def _spin_tick(self):
+        if self._spinner_btn is None:
+            return
+        glyph = SPINNER_FRAMES[self._spinner_frame % len(SPINNER_FRAMES)]
+        self._spinner_btn.configure(text=f"{glyph}  {self._spinner_label}")
+        self._spinner_frame += 1
+        self._spinner_job = self.after(90, self._spin_tick)
+
+    def _stop_spinner(self):
+        if self._spinner_job is not None:
+            self.after_cancel(self._spinner_job)
+            self._spinner_job = None
+        if self._spinner_btn is not None and self._busy_restore_text:
+            self._spinner_btn.configure(text=self._busy_restore_text)
+        self._spinner_btn = None
 
     # =======================================================================
     # Crop operation
@@ -1384,7 +1435,8 @@ class App(ctk.CTk):
 
         self.progress.set(0)
         self.progress_count.configure(text=f"0 / {len(files)}")
-        self._set_busy(True, "Cropping…")
+        self._set_busy(True, "Cropping…", op_btn=self.crop_btn,
+                       op_label="Cropping", op_restore="Crop Photos")
         self._log(f"\n═══ Cropping {len(files)} photo(s) ═══")
 
         def worker():
@@ -1436,7 +1488,8 @@ class App(ctk.CTk):
 
         self.progress.set(0)
         self.progress_count.configure(text="")
-        self._set_busy(True, "Sending…")
+        self._set_busy(True, "Sending…", op_btn=self.send_btn,
+                       op_label="Sending", op_restore="Send Photos")
         self._log("\n═══ Sending photos ═══")
 
         def worker():

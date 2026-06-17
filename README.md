@@ -97,47 +97,6 @@ Click **Save Settings**. No environment variables needed. The app remembers your
 
 ---
 
-## Command-line usage (advanced)
-
-Requires the `ANTHROPIC_API_KEY` environment variable.
-
-```bash
-# Single file
-python smart_crop.py crop photo.jpg
-
-# Multiple files / entire directory
-python smart_crop.py crop photos/ -o cropped/
-
-# Preview crop boxes without writing files
-python smart_crop.py crop photos/ --dry-run
-
-# Use a different Claude model
-python smart_crop.py crop photos/ --model claude-sonnet-4-6
-```
-
-Output files are saved next to the originals with `_16x9` appended (e.g. `sunset.jpg` → `sunset_16x9.jpg`), unless `--output-dir` is set.
-
-#### Crop options
-
-| Flag | Description |
-|---|---|
-| `-o / --output-dir DIR` | Write output files to `DIR` |
-| `--suffix TEXT` | Suffix before extension (default: `_16x9`) |
-| `--model MODEL` | Claude model ID (default: `claude-opus-4-7`) |
-| `--dry-run` | Preview crop boxes without writing files |
-
-#### Send options
-
-| Flag | Description |
-|---|---|
-| `--from ADDRESS` | Your email address **(required)** |
-| `--to ADDRESS` | Recipient address |
-| `--smtp-host HOST` | SMTP host (default: `smtp.mail.yahoo.com`) |
-| `--smtp-port PORT` | SMTP port (default: `587`) |
-| `--smtp-password PW` | App password (prefer `SMTP_PASSWORD` env var) |
-
----
-
 ## Supported formats
 
 JPEG · PNG · WebP · GIF

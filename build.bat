@@ -14,6 +14,8 @@ pyinstaller ^
   --onefile ^
   --windowed ^
   --collect-data customtkinter ^
+  --add-data "assets;assets" ^
+  --icon "assets\icon.ico" ^
   --name "SkylightCropping" ^
   app.py
 

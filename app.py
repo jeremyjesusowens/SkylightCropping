@@ -219,7 +219,7 @@ def save_settings(settings: dict) -> None:
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title(f"Skylight Cropping — {APP_VERSION}")
+        self.title("Skylight Cropping")
         self.geometry("1200x920")
         self.minsize(1040, 780)
         self.configure(fg_color=BG)

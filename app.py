@@ -1217,6 +1217,9 @@ class App(ctk.CTk):
                         fg_color=PANEL2, corner_radius=10, padx=10, pady=3).pack(
                 side="left", padx=(0, 6))
 
+        self._ghost(info, "Full Review →", lambda p=path: self._open_rate_detail(p),
+                   width=140, height=26).grid(row=3, column=0, sticky="w", pady=(8, 0))
+
         ring = tk.Canvas(card, width=72, height=72, bg=PANEL, highlightthickness=0)
         ring.grid(row=0, column=2, rowspan=2, padx=14, pady=14)
         if path in self._rate_animated:
@@ -1230,15 +1233,18 @@ class App(ctk.CTk):
                         text_color=DIM).grid(row=1, column=1, sticky="w", padx=(0, 14),
                                              pady=(0, 10))
 
-    def _draw_score_ring(self, canvas: tk.Canvas, value: int, color: str):
+    def _draw_score_ring(self, canvas: tk.Canvas, value: int, color: str, pad: int = 6):
         canvas.delete("all")
-        canvas.create_oval(6, 6, 66, 66, outline=STROKE, width=6)
+        w, h = int(canvas["width"]), int(canvas["height"])
+        x0, y0, x1, y1 = pad, pad, w - pad, h - pad
+        canvas.create_oval(x0, y0, x1, y1, outline=STROKE, width=6)
         extent = -max(0, min(100, value)) * 3.6
         if extent:
-            canvas.create_arc(6, 6, 66, 66, start=90, extent=extent,
+            canvas.create_arc(x0, y0, x1, y1, start=90, extent=extent,
                               style=tk.ARC, outline=color, width=6)
-        canvas.create_text(36, 36, text=str(int(value)), fill=TXT,
-                           font=("Courier New", 16, "bold"))
+        font_size = max(12, round((x1 - x0) * 0.26))
+        canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=str(int(value)), fill=TXT,
+                           font=("Courier New", font_size, "bold"))
 
     def _animate_score_ring(self, canvas: tk.Canvas, target: int, color: str, frame: int):
         if not canvas.winfo_exists():
@@ -1248,6 +1254,98 @@ class App(ctk.CTk):
         self._draw_score_ring(canvas, value, color)
         if frame < steps:
             self.after(25, lambda: self._animate_score_ring(canvas, target, color, frame + 1))
+
+    def _open_rate_detail(self, path: str):
+        result = self.rate_results.get(path)
+        if not result or result.status != "rated":
+            return
+        tier = score_tier(result.score)
+        color = TIER_COLORS[tier]
+
+        win = ctk.CTkToplevel(self)
+        win.title(Path(path).name)
+        win.geometry("760x680")
+        win.configure(fg_color=BG)
+        win.transient(self)
+
+        body = ctk.CTkScrollableFrame(win, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=22, pady=22)
+
+        try:
+            pil, (ow, oh) = self._get_preview_image(path)
+            disp_w = 700
+            disp_h = max(1, round(disp_w * oh / ow))
+            disp = pil.resize((disp_w, disp_h), Image.LANCZOS)
+            tkimg = ImageTk.PhotoImage(disp)
+            img_lbl = ctk.CTkLabel(body, text="", image=tkimg)
+            img_lbl.image = tkimg  # keep a reference so it isn't GC'd
+            img_lbl.pack(pady=(0, 18))
+        except Exception:
+            pass
+
+        header = ctk.CTkFrame(body, fg_color="transparent")
+        header.pack(fill="x", pady=(0, 14))
+        ring = tk.Canvas(header, width=92, height=92, bg=BG, highlightthickness=0)
+        ring.pack(side="left", padx=(0, 18))
+        self._draw_score_ring(ring, result.score, color, pad=4)
+
+        title_box = ctk.CTkFrame(header, fg_color="transparent")
+        title_box.pack(side="left", fill="x", expand=True)
+        crown = "👑 " if result.score >= 85 else ""
+        ctk.CTkLabel(title_box, text=f'{crown}"{result.headline}"', font=self.f_h1,
+                    text_color=color, anchor="w").pack(anchor="w")
+        ctk.CTkLabel(title_box, text=TIER_LABELS[tier], font=self.f_label,
+                    text_color=MUTED, anchor="w").pack(anchor="w")
+
+        if result.summary:
+            ctk.CTkLabel(body, text=result.summary, font=self.f_label, text_color=TXT,
+                        wraplength=700, justify="left", anchor="w").pack(
+                fill="x", pady=(0, 16))
+
+        for cat in result.categories:
+            row = ctk.CTkFrame(body, corner_radius=10, fg_color=PANEL,
+                               border_width=1, border_color=STROKE)
+            row.pack(fill="x", pady=5)
+            row.grid_columnconfigure(0, weight=1)
+            top = ctk.CTkFrame(row, fg_color="transparent")
+            top.grid(row=0, column=0, sticky="ew", padx=16, pady=(12, 4))
+            top.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(top, text=cat["name"], font=self.f_section, text_color=MUTED,
+                        anchor="w").grid(row=0, column=0, sticky="w")
+            ctk.CTkLabel(top, text=str(cat["score"]), font=self.f_button,
+                        text_color=color).grid(row=0, column=1, sticky="e")
+            bar = ctk.CTkProgressBar(row, height=6, corner_radius=3, progress_color=color,
+                                     fg_color=PANEL2)
+            bar.grid(row=1, column=0, sticky="ew", padx=16)
+            bar.set(cat["score"] / 100)
+            if cat.get("comment"):
+                ctk.CTkLabel(row, text=cat["comment"], font=self.f_label, text_color=TXT,
+                            anchor="w", justify="left", wraplength=680).grid(
+                    row=2, column=0, sticky="ew", padx=16, pady=(6, 12))
+
+        if result.tip:
+            tip_card = ctk.CTkFrame(body, corner_radius=10, fg_color=PANEL,
+                                    border_width=1, border_color=ACCENT)
+            tip_card.pack(fill="x", pady=(10, 0))
+            ctk.CTkLabel(tip_card, text=f"💡  {result.tip}", font=self.f_label,
+                        text_color=TXT, anchor="w", justify="left", wraplength=680).pack(
+                fill="x", padx=16, pady=12)
+
+        if not result.summary and not result.categories:
+            ctk.CTkLabel(body, text="No detailed review for this rating yet — "
+                        "use Force re-rate to get one.", font=self.f_label,
+                        text_color=DIM, wraplength=680, justify="left").pack(
+                fill="x", pady=(10, 0))
+
+        if result.tags:
+            tag_row = ctk.CTkFrame(body, fg_color="transparent")
+            tag_row.pack(fill="x", pady=(16, 0))
+            for tag in result.tags:
+                ctk.CTkLabel(tag_row, text=tag, font=self.f_small, text_color=color,
+                            fg_color=PANEL2, corner_radius=10, padx=10, pady=3).pack(
+                    side="left", padx=(0, 6))
+
+        self._ghost(body, "Close", win.destroy, width=100).pack(pady=(20, 0))
 
     def _pulse_tick(self):
         try:

@@ -27,6 +27,12 @@ except Exception:
 import customtkinter as ctk
 from PIL import Image, ImageOps, ImageTk
 
+
+def _resource_path(*parts: str) -> Path:
+    """Resolve a bundled resource, accounting for PyInstaller's extraction dir."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    return base.joinpath(*parts)
+
 from prompt_eval import DEFAULT_MODEL as PROMPT_EVAL_DEFAULT_MODEL
 from prompt_eval import PROMPT_VARIANTS, run_prompt_eval
 from smart_crop import (FALLBACK_MODELS, CropResult, collect_images,
@@ -195,8 +201,8 @@ class App(ctk.CTk):
         self.minsize(1040, 780)
         self.configure(fg_color=BG)
 
-        _icon_png = Path(__file__).parent / "assets" / "icon.png"
-        _icon_ico = Path(__file__).parent / "assets" / "icon.ico"
+        _icon_png = _resource_path("assets", "icon.png")
+        _icon_ico = _resource_path("assets", "icon.ico")
         if sys.platform == "win32" and _icon_ico.exists():
             self.iconbitmap(str(_icon_ico))
         elif _icon_png.exists():

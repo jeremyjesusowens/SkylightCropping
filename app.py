@@ -33,6 +33,29 @@ def _resource_path(*parts: str) -> Path:
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
     return base.joinpath(*parts)
 
+
+def _get_build_version() -> str:
+    """Identify the exact commit/build this binary was produced from.
+
+    Build scripts write build_info.txt (short commit SHA) next to app.py
+    before invoking PyInstaller, and it gets bundled via --add-data so a
+    packaged exe can report what it was built from. When running from
+    source with no such file, fall back to asking git directly.
+    """
+    build_info = _resource_path("build_info.txt")
+    if build_info.exists():
+        return build_info.read_text(encoding="utf-8").strip()
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).parent, stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+    except Exception:
+        return "dev"
+
+
+APP_VERSION = _get_build_version()
+
 from prompt_eval import DEFAULT_MODEL as PROMPT_EVAL_DEFAULT_MODEL
 from prompt_eval import PROMPT_VARIANTS, run_prompt_eval
 from smart_crop import (FALLBACK_MODELS, CropResult, collect_images,
@@ -196,7 +219,7 @@ def save_settings(settings: dict) -> None:
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Skylight Cropping")
+        self.title(f"Skylight Cropping — {APP_VERSION}")
         self.geometry("1200x920")
         self.minsize(1040, 780)
         self.configure(fg_color=BG)
@@ -402,6 +425,8 @@ class App(ctk.CTk):
         self.progress_count = ctk.CTkLabel(row, text="", anchor="e",
                                            font=self.f_button, text_color=ACCENT)
         self.progress_count.grid(row=0, column=1, sticky="e")
+        ctk.CTkLabel(row, text=APP_VERSION, anchor="e",
+                     font=self.f_small, text_color=MUTED).grid(row=0, column=2, sticky="e", padx=(12, 0))
 
         self.progress = ctk.CTkProgressBar(footer, height=8, corner_radius=4,
                                            progress_color=ACCENT, fg_color=PANEL2)

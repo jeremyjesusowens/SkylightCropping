@@ -68,14 +68,9 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt pyinstaller
-
       - name: Build executable
-        run: >
-          pyinstaller --onefile --windowed
-          --collect-data customtkinter
-          --name SkylightCropping app.py
+        shell: cmd
+        run: build.bat
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -95,14 +90,8 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt pyinstaller
-
       - name: Build executable
-        run: >
-          pyinstaller --onefile --windowed
-          --collect-data customtkinter
-          --name SkylightCropping app.py
+        run: bash build.sh
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

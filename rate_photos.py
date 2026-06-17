@@ -48,12 +48,22 @@ DEFAULT_RATE_MODEL = RATE_MODELS[0]
 RATE_PROMPT = (
     "You are a fun, encouraging photography critic rating a personal photo for a "
     "digital picture frame slideshow. Judge composition, lighting, emotional impact, "
-    "and overall appeal.\n\n"
-    "Return ONLY a JSON object, no explanation:\n"
+    "subject/moment, and technical quality.\n\n"
+    "Return ONLY a JSON object, no explanation. Include both a short version for a "
+    "compact list view and a longer breakdown for a detail view someone can open by "
+    "clicking the photo:\n"
     '{"score": <integer 0-100, overall appeal>, '
     '"headline": "<punchy 2-4 word verdict, e.g. \'Pure Magic\' or \'Solid Snapshot\'>", '
-    '"feedback": "<one specific, encouraging sentence, max 20 words>", '
-    '"tags": [<1-3 short lowercase strengths, e.g. \'composition\', \'lighting\', \'candid moment\'>]}'
+    '"feedback": "<one specific, encouraging sentence, max 20 words, for the list view>", '
+    '"tags": [<1-3 short lowercase strengths, e.g. \'composition\', \'lighting\', \'candid moment\'>], '
+    '"summary": "<2-3 sentence expanded review for the detail view>", '
+    '"categories": ['
+    '{"name": "Composition", "score": <0-100>, "comment": "<one sentence>"}, '
+    '{"name": "Lighting", "score": <0-100>, "comment": "<one sentence>"}, '
+    '{"name": "Subject & Moment", "score": <0-100>, "comment": "<one sentence>"}, '
+    '{"name": "Technical Quality", "score": <0-100>, "comment": "<one sentence>"}'
+    '], '
+    '"tip": "<one specific, actionable suggestion for an even better shot next time>"}'
 )
 
 _SETTINGS_DIR = (
@@ -76,6 +86,12 @@ class RatingResult:
     headline: Optional[str] = None
     feedback: Optional[str] = None
     tags: list[str] = field(default_factory=list)
+    # In-depth fields, shown in a detail view opened by clicking the photo.
+    # Fetched in the same API call as the list-view fields above, so the
+    # extra detail doesn't cost a second request.
+    summary: Optional[str] = None
+    categories: list[dict] = field(default_factory=list)  # [{"name", "score", "comment"}]
+    tip: Optional[str] = None
     error: Optional[str] = None
     cached: bool = False  # True when served from the local cache (no API call)
 
@@ -126,9 +142,13 @@ def _cache_key(path: Path, model: str) -> str:
 
 
 def _cache_entry_to_result(path: str, entry: dict) -> RatingResult:
+    # .get() with defaults so ratings cached before the detail fields existed
+    # still load fine — they just show no detail view until re-rated.
     return RatingResult(
         path=path, status="rated", score=entry["score"], headline=entry["headline"],
-        feedback=entry["feedback"], tags=list(entry.get("tags", [])), cached=True,
+        feedback=entry["feedback"], tags=list(entry.get("tags", [])),
+        summary=entry.get("summary"), categories=list(entry.get("categories", [])),
+        tip=entry.get("tip"), cached=True,
     )
 
 
@@ -155,7 +175,7 @@ def get_rating(client: anthropic.Anthropic, image_path: Path, model: str) -> dic
     data, media_type = _encode_for_rating(image_path)
     response = client.messages.create(
         model=model,
-        max_tokens=200,
+        max_tokens=600,
         messages=[
             {
                 "role": "user",
@@ -182,7 +202,24 @@ def get_rating(client: anthropic.Anthropic, image_path: Path, model: str) -> dic
     headline = str(parsed.get("headline", "")).strip() or "Nice Shot"
     feedback = str(parsed.get("feedback", "")).strip()
     tags = [str(t).strip().lower() for t in parsed.get("tags", []) if str(t).strip()][:3]
-    return {"score": score, "headline": headline, "feedback": feedback, "tags": tags}
+    summary = str(parsed.get("summary", "")).strip()
+    categories = []
+    for c in parsed.get("categories", [])[:6]:
+        if not isinstance(c, dict):
+            continue
+        try:
+            categories.append({
+                "name": str(c.get("name", "")).strip() or "Category",
+                "score": max(0, min(100, int(c.get("score", score)))),
+                "comment": str(c.get("comment", "")).strip(),
+            })
+        except (TypeError, ValueError):
+            continue
+    tip = str(parsed.get("tip", "")).strip()
+    return {
+        "score": score, "headline": headline, "feedback": feedback, "tags": tags,
+        "summary": summary, "categories": categories, "tip": tip,
+    }
 
 
 def run_rate(
@@ -245,6 +282,7 @@ def run_rate(
             result_fn(RatingResult(
                 path=str(img_path), status="rated", score=data["score"],
                 headline=data["headline"], feedback=data["feedback"], tags=data["tags"],
+                summary=data["summary"], categories=data["categories"], tip=data["tip"],
             ))
         progress_fn(i, total)
 

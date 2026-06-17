@@ -5,5 +5,3 @@ dist/
 build/
 build_info.txt
 .env
-
-eval_out/

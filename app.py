@@ -59,6 +59,8 @@ APP_VERSION = _get_build_version()
 from smart_crop import (FALLBACK_MODELS, CropResult, collect_images,
                         compute_crop_box, list_models, recrop_image, run_crop,
                         run_send)
+from rate_photos import (RATE_MODELS, DEFAULT_RATE_MODEL, RatingResult,
+                         clear_cache as clear_rating_cache, run_rate, score_tier)
 
 # ---------------------------------------------------------------------------
 # Settings persistence
@@ -118,6 +120,12 @@ WARN      = "#e8a328"   # caution / crop warning
 THUMB     = "#1b1d2e"   # thumbnail placeholder
 SEL       = "#1d2030"   # selected row
 HOVER     = "#191b2a"   # subtle hover
+GOLD      = "#f4c95d"   # top-tier rating glow
+
+# Rate tab — score tiers (cheap Haiku-rated photos bucketed for display)
+TIER_COLORS = {"stunning": GOLD, "great": ACCENT, "good": DONE, "meh": MUTED}
+TIER_LABELS = {"stunning": "🏆 Stunning", "great": "✨ Great", "good": "👍 Good", "meh": "🤔 Meh"}
+RATE_THUMB_SIZE = (168, 94)
 
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
@@ -188,6 +196,8 @@ def load_settings() -> dict:
         "crop_output_dir": "",
         "send_dir": "",
         "model_list": list(FALLBACK_MODELS),
+        "rate_files": [],
+        "rate_model": DEFAULT_RATE_MODEL,
     }
     if SETTINGS_FILE.exists():
         try:
@@ -237,6 +247,7 @@ class App(ctk.CTk):
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.progress_queue: queue.Queue[tuple[int, int]] = queue.Queue()
         self.result_queue: queue.Queue = queue.Queue()
+        self.rate_result_queue: queue.Queue = queue.Queue()
         self._running = False
         self._spinner_btn = None
         self._spinner_job = None
@@ -255,6 +266,15 @@ class App(ctk.CTk):
         self.thumb_jobs: queue.Queue[str] = queue.Queue()
         self.thumb_ready: queue.Queue[tuple[str, Image.Image]] = queue.Queue()
         self._thumb_requested: set[str] = set()
+
+        # Rate tab state — separate from the crop queue above by design.
+        self.rate_paths: list[str] = []
+        self.rate_results: dict[str, RatingResult] = {}
+        self._rate_dirty = False
+        self._rate_thumb_cache: dict[str, ctk.CTkImage] = {}
+        self._rate_animated: set[str] = set()
+        self._pulse_card = None
+        self._pulse_on = False
 
         # Fonts — humanist sans; Courier New / Menlo for mono.
         # Trebuchet MS ships with Windows; Helvetica Neue is the macOS fallback.
@@ -290,8 +310,16 @@ class App(ctk.CTk):
         else:
             self._render_preview(None)
 
+        for f in self.settings.get("rate_files", []):
+            f = str(Path(f))
+            if Path(f).exists() and f not in self.rate_paths:
+                self.rate_paths.append(f)
+        self._refresh_rate_count()
+        self._render_rate_gallery()
+
         threading.Thread(target=self._thumb_worker, daemon=True).start()
         self._poll_queues()
+        self._pulse_tick()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         if self.settings.get("api_key", "").strip():
@@ -313,6 +341,7 @@ class App(ctk.CTk):
 
         self.frames = {
             "Crop": ctk.CTkFrame(self.content, fg_color=BG),
+            "Rate": ctk.CTkFrame(self.content, fg_color=BG),
             "Send": ctk.CTkFrame(self.content, fg_color=BG),
             "Settings": ctk.CTkFrame(self.content, fg_color=BG),
         }
@@ -320,6 +349,7 @@ class App(ctk.CTk):
             fr.grid(row=0, column=0, sticky="nsew")
 
         self._build_crop_tab(self.frames["Crop"])
+        self._build_rate_tab(self.frames["Rate"])
         self._build_send_tab(self.frames["Send"])
         self._build_settings_tab(self.frames["Settings"])
 
@@ -351,7 +381,7 @@ class App(ctk.CTk):
         self.nav_bars: dict[str, ctk.CTkFrame] = {}
         self.nav_bar_x: dict[str, int] = {}
         x0 = 510 if sys.platform == "darwin" else 440
-        for i, name in enumerate(("Crop", "Send", "Settings")):
+        for i, name in enumerate(("Crop", "Rate", "Send", "Settings")):
             b = ctk.CTkButton(bar, text=name.upper(), font=self.f_nav, width=92,
                               fg_color="transparent", hover_color=HOVER,
                               text_color=MUTED,
@@ -914,6 +944,321 @@ class App(ctk.CTk):
                       text=text, justify="center", width=w - 80)
 
     # =======================================================================
+    # Rate tab — cheap AI ratings/feedback, fully separate from cropping.
+    # =======================================================================
+
+    def _build_rate_tab(self, tab):
+        tab.grid_rowconfigure(1, weight=1)
+        tab.grid_columnconfigure(0, weight=1)
+
+        controls = ctk.CTkFrame(tab, fg_color="transparent")
+        controls.grid(row=0, column=0, sticky="ew")
+
+        c = self._card(controls, "Photos to rate")
+        c.grid_columnconfigure(1, weight=1)
+        btns = ctk.CTkFrame(c, fg_color="transparent")
+        btns.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 4))
+        self.rate_add_files_btn = self._ghost(btns, "Add Files", self._add_rate_files, width=98)
+        self.rate_add_files_btn.pack(side="left", padx=(0, 6))
+        self.rate_add_folder_btn = self._ghost(btns, "Add Folder", self._add_rate_folder, width=104)
+        self.rate_add_folder_btn.pack(side="left", padx=(0, 6))
+        self.rate_clear_btn = self._ghost(btns, "Clear", self._clear_rate_files, width=62)
+        self.rate_clear_btn.pack(side="left")
+        self.rate_count_label = ctk.CTkLabel(btns, text="0 queued", font=self.f_label,
+                                             text_color=MUTED)
+        self.rate_count_label.pack(side="right")
+
+        ctk.CTkLabel(c, text="Model", font=self.f_label, text_color=MUTED).grid(
+            row=1, column=0, sticky="w", pady=(8, 0))
+        mf = ctk.CTkFrame(c, fg_color="transparent")
+        mf.grid(row=1, column=1, sticky="w", pady=(8, 0))
+        self.rate_model_var = ctk.StringVar(value=self.settings.get("rate_model", DEFAULT_RATE_MODEL))
+        rate_model_values = list(RATE_MODELS)
+        if self.rate_model_var.get() not in rate_model_values:
+            rate_model_values = [self.rate_model_var.get(), *rate_model_values]
+        ctk.CTkOptionMenu(
+            mf, values=rate_model_values, variable=self.rate_model_var, width=260,
+            fg_color=PANEL2, button_color=STROKE, button_hover_color=ACCENT,
+            text_color=TXT, dropdown_fg_color=PANEL, dropdown_text_color=TXT,
+            dropdown_hover_color=HOVER).pack(side="left")
+        ctk.CTkLabel(c, text="Haiku is cheapest — fine for quick ratings",
+                     font=self.f_small, text_color=DIM, anchor="w").grid(
+            row=1, column=2, sticky="w", padx=(12, 0), pady=(8, 0))
+
+        self.rate_force_var = ctk.BooleanVar(value=False)
+        ctk.CTkSwitch(c, text="Force re-rate (ignore cache)", variable=self.rate_force_var,
+                      font=self.f_label, text_color=TXT, progress_color=ACCENT,
+                      button_color=TXT, fg_color=STROKE).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        self._ghost(c, "Clear Ratings Cache", self._clear_ratings_cache, width=156).grid(
+            row=2, column=2, sticky="e", pady=(10, 0))
+
+        filt = ctk.CTkFrame(controls, fg_color="transparent")
+        filt.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(filt, text="SHOW", font=self.f_section, text_color=MUTED).pack(
+            side="left", padx=(2, 10))
+        self.rate_filter_var = ctk.StringVar(value="all")
+        self.rate_filter_btns: dict[str, ctk.CTkButton] = {}
+        for key, label in (("all", "All"), ("stunning", "🏆 Stunning"), ("great", "✨ Great"),
+                          ("good", "👍 Good"), ("meh", "🤔 Meh")):
+            b = self._ghost(filt, label, lambda k=key: self._set_rate_filter(k), width=92, height=28)
+            b.pack(side="left", padx=(0, 6))
+            self.rate_filter_btns[key] = b
+        self.rate_sort_var = ctk.StringVar(value="score")
+        sort_box = ctk.CTkFrame(filt, fg_color="transparent")
+        sort_box.pack(side="right")
+        ctk.CTkLabel(sort_box, text="SORT", font=self.f_section, text_color=MUTED).pack(
+            side="left", padx=(0, 8))
+        self.rate_sort_btns: dict[str, ctk.CTkButton] = {}
+        for key, label in (("score", "Top Rated"), ("added", "Order Added")):
+            b = self._ghost(sort_box, label, lambda k=key: self._set_rate_sort(k), width=104, height=28)
+            b.pack(side="left", padx=(0, 6))
+            self.rate_sort_btns[key] = b
+        self._update_rate_toggle_styles()
+
+        self.rate_btn = self._primary(controls, "Rate Photos", self._run_rate, height=46)
+        self.rate_btn.pack(fill="x", pady=(0, 12))
+
+        self.rate_gallery = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        self.rate_gallery.grid(row=1, column=0, sticky="nsew")
+
+    def _set_rate_filter(self, key: str):
+        self.rate_filter_var.set(key)
+        self._update_rate_toggle_styles()
+        self._render_rate_gallery()
+
+    def _set_rate_sort(self, key: str):
+        self.rate_sort_var.set(key)
+        self._update_rate_toggle_styles()
+        self._render_rate_gallery()
+
+    def _update_rate_toggle_styles(self):
+        for key, b in self.rate_filter_btns.items():
+            active = key == self.rate_filter_var.get()
+            b.configure(fg_color=ACCENT if active else PANEL2,
+                       text_color=ACCENT_INK if active else TXT,
+                       border_color=ACCENT if active else STROKE)
+        for key, b in self.rate_sort_btns.items():
+            active = key == self.rate_sort_var.get()
+            b.configure(fg_color=ACCENT if active else PANEL2,
+                       text_color=ACCENT_INK if active else TXT,
+                       border_color=ACCENT if active else STROKE)
+
+    # -- queue management ------------------------------------------------
+
+    def _add_rate_files(self):
+        files = filedialog.askopenfilenames(
+            title="Select photos",
+            filetypes=[
+                ("Images", "*.jpg *.jpeg *.png *.webp *.gif *.JPG *.JPEG *.PNG *.WEBP *.GIF"),
+                ("All files", "*.*"),
+            ],
+        )
+        self._ingest_rate(files)
+
+    def _add_rate_folder(self):
+        folder = filedialog.askdirectory(title="Select folder of photos")
+        if not folder:
+            return
+        self._ingest_rate(str(p) for p in collect_images([folder], log=lambda _: None))
+
+    def _ingest_rate(self, paths) -> None:
+        added = False
+        for f in paths:
+            f = str(Path(f))
+            if f not in self.rate_paths:
+                self.rate_paths.append(f)
+                added = True
+        if added:
+            self._refresh_rate_count()
+            self._render_rate_gallery()
+            self._persist_paths()
+
+    def _clear_rate_files(self):
+        self.rate_paths.clear()
+        self.rate_results.clear()
+        self._rate_animated.clear()
+        self._refresh_rate_count()
+        self._render_rate_gallery()
+        self._persist_paths()
+
+    def _refresh_rate_count(self):
+        self.rate_count_label.configure(text=f"{len(self.rate_paths)} queued")
+
+    def _clear_ratings_cache(self):
+        if messagebox.askyesno("Clear Ratings Cache",
+                               "This removes every cached rating from disk. "
+                               "Re-rating those photos later will call the API again. Continue?"):
+            clear_rating_cache()
+            self._log("Ratings cache cleared.")
+
+    # -- gallery rendering -------------------------------------------------
+
+    def _get_rate_thumb(self, path: str):
+        img = self._rate_thumb_cache.get(path)
+        if img is not None:
+            return img
+        try:
+            pil = make_thumbnail(path, RATE_THUMB_SIZE)
+        except Exception:
+            return None
+        img = ctk.CTkImage(light_image=pil, dark_image=pil, size=RATE_THUMB_SIZE)
+        self._rate_thumb_cache[path] = img
+        return img
+
+    def _render_rate_gallery(self):
+        for w in self.rate_gallery.winfo_children():
+            w.destroy()
+        self._pulse_card = None
+
+        if not self.rate_paths:
+            ctk.CTkLabel(self.rate_gallery, text="Add photos above and hit Rate Photos —\n"
+                        "Claude will score each one and leave a one-line review.",
+                        font=self.f_label, text_color=DIM, justify="center").pack(pady=60)
+            return
+
+        paths = list(self.rate_paths)
+        sort_key = self.rate_sort_var.get()
+        if sort_key == "score":
+            paths.sort(key=lambda p: (self.rate_results[p].score
+                                      if p in self.rate_results and self.rate_results[p].score is not None
+                                      else -1), reverse=True)
+
+        filter_key = self.rate_filter_var.get()
+        top_score, top_path = -1, None
+        for p in paths:
+            r = self.rate_results.get(p)
+            if r and r.status == "rated" and r.score is not None and r.score > top_score:
+                top_score, top_path = r.score, p
+
+        shown_any = False
+        for path in paths:
+            result = self.rate_results.get(path)
+            if filter_key != "all" and (not result or result.status != "rated"
+                                        or score_tier(result.score) != filter_key):
+                continue
+            shown_any = True
+            self._build_rate_card(path, result, is_top=(path == top_path and top_score >= 70))
+
+        if not shown_any:
+            ctk.CTkLabel(self.rate_gallery, text="No photos match this filter yet.",
+                        font=self.f_label, text_color=DIM).pack(pady=40)
+
+    def _build_rate_card(self, path: str, result, is_top: bool):
+        name = Path(path).name
+        if result is None:
+            card = ctk.CTkFrame(self.rate_gallery, corner_radius=10, fg_color=PANEL,
+                                border_width=1, border_color=STROKE)
+            card.pack(fill="x", pady=5, padx=2)
+            ctk.CTkLabel(card, text=f"●  {name}", font=self.f_mono, text_color=DIM,
+                        anchor="w").pack(side="left", padx=14, pady=14)
+            ctk.CTkLabel(card, text="queued", font=self.f_small, text_color=DIM).pack(
+                side="right", padx=14)
+            return
+
+        if result.status == "analyzing":
+            card = ctk.CTkFrame(self.rate_gallery, corner_radius=10, fg_color=PANEL,
+                                border_width=1, border_color=ACCENT)
+            card.pack(fill="x", pady=5, padx=2)
+            ctk.CTkLabel(card, text=f"⠿  {name}", font=self.f_mono, text_color=TXT,
+                        anchor="w").pack(side="left", padx=14, pady=14)
+            ctk.CTkLabel(card, text="analyzing…", font=self.f_small, text_color=ACCENT).pack(
+                side="right", padx=14)
+            return
+
+        if result.status == "failed":
+            card = ctk.CTkFrame(self.rate_gallery, corner_radius=10, fg_color=PANEL,
+                                border_width=1, border_color=ERRC)
+            card.pack(fill="x", pady=5, padx=2)
+            ctk.CTkLabel(card, text=f"✗  {name}", font=self.f_mono, text_color=ERRC,
+                        anchor="w").pack(side="left", padx=14, pady=14)
+            ctk.CTkLabel(card, text=result.error or "failed", font=self.f_small,
+                        text_color=ERRC, wraplength=260).pack(side="right", padx=14)
+            return
+
+        # rated — the flashy card
+        tier = score_tier(result.score)
+        color = TIER_COLORS[tier]
+        border_w = 3 if is_top else 2
+        card = ctk.CTkFrame(self.rate_gallery, corner_radius=16, fg_color=PANEL,
+                            border_width=border_w, border_color=color)
+        card.pack(fill="x", pady=8, padx=2)
+        card.grid_columnconfigure(1, weight=1)
+        if is_top:
+            self._pulse_card = card
+
+        thumb_img = self._get_rate_thumb(path)
+        thumb_lbl = ctk.CTkLabel(card, text="" if thumb_img else "📷", image=thumb_img,
+                                 width=RATE_THUMB_SIZE[0], height=RATE_THUMB_SIZE[1],
+                                 fg_color=THUMB, corner_radius=10)
+        thumb_lbl.grid(row=0, column=0, rowspan=2, padx=14, pady=14, sticky="n")
+
+        info = ctk.CTkFrame(card, fg_color="transparent")
+        info.grid(row=0, column=1, sticky="ew", padx=(0, 14), pady=(14, 0))
+        info.grid_columnconfigure(0, weight=1)
+        top_row = ctk.CTkFrame(info, fg_color="transparent")
+        top_row.grid(row=0, column=0, sticky="ew")
+        crown = "👑 " if is_top else ""
+        ctk.CTkLabel(top_row, text=f'{crown}"{result.headline}"', font=self.f_word_it,
+                    text_color=color, anchor="w").pack(side="left")
+        disp_name = name if len(name) <= 34 else name[:31] + "…"
+        ctk.CTkLabel(top_row, text=disp_name, font=self.f_small, text_color=DIM).pack(
+            side="right")
+
+        if result.feedback:
+            ctk.CTkLabel(info, text=result.feedback, font=self.f_label, text_color=TXT,
+                        anchor="w", justify="left", wraplength=520).grid(
+                row=1, column=0, sticky="ew", pady=(4, 6))
+
+        tag_row = ctk.CTkFrame(info, fg_color="transparent")
+        tag_row.grid(row=2, column=0, sticky="w")
+        for tag in result.tags:
+            ctk.CTkLabel(tag_row, text=tag, font=self.f_small, text_color=color,
+                        fg_color=PANEL2, corner_radius=10, padx=10, pady=3).pack(
+                side="left", padx=(0, 6))
+
+        ring = tk.Canvas(card, width=72, height=72, bg=PANEL, highlightthickness=0)
+        ring.grid(row=0, column=2, rowspan=2, padx=14, pady=14)
+        if path in self._rate_animated:
+            self._draw_score_ring(ring, result.score, color)
+        else:
+            self._rate_animated.add(path)
+            self._animate_score_ring(ring, result.score, color, frame=0)
+
+        if result.cached:
+            ctk.CTkLabel(card, text="from cache · no API cost", font=self.f_small,
+                        text_color=DIM).grid(row=1, column=1, sticky="w", padx=(0, 14),
+                                             pady=(0, 10))
+
+    def _draw_score_ring(self, canvas: tk.Canvas, value: int, color: str):
+        canvas.delete("all")
+        canvas.create_oval(6, 6, 66, 66, outline=STROKE, width=6)
+        extent = -max(0, min(100, value)) * 3.6
+        if extent:
+            canvas.create_arc(6, 6, 66, 66, start=90, extent=extent,
+                              style=tk.ARC, outline=color, width=6)
+        canvas.create_text(36, 36, text=str(int(value)), fill=TXT,
+                           font=("Courier New", 16, "bold"))
+
+    def _animate_score_ring(self, canvas: tk.Canvas, target: int, color: str, frame: int):
+        if not canvas.winfo_exists():
+            return
+        steps = 18
+        value = round(target * min(1.0, (frame + 1) / steps))
+        self._draw_score_ring(canvas, value, color)
+        if frame < steps:
+            self.after(25, lambda: self._animate_score_ring(canvas, target, color, frame + 1))
+
+    def _pulse_tick(self):
+        try:
+            if self._pulse_card is not None and self._pulse_card.winfo_exists():
+                self._pulse_on = not self._pulse_on
+                self._pulse_card.configure(border_width=4 if self._pulse_on else 3)
+        except Exception:
+            pass
+        self.after(550, self._pulse_tick)
+
+    # =======================================================================
     # Send tab
     # =======================================================================
 
@@ -1080,6 +1425,8 @@ class App(ctk.CTk):
         self.settings["crop_files"] = [it["path"] for it in self.items]
         self.settings["crop_output_dir"] = self.output_dir_var.get().strip()
         self.settings["send_dir"] = self.send_dir_var.get().strip()
+        self.settings["rate_files"] = list(self.rate_paths)
+        self.settings["rate_model"] = self.rate_model_var.get()
         save_settings(self.settings)
 
     def _save_settings(self):
@@ -1191,6 +1538,16 @@ class App(ctk.CTk):
         except queue.Empty:
             pass
 
+        # rate results — batched into one gallery re-render per poll tick
+        try:
+            while True:
+                self._apply_rate_result(self.rate_result_queue.get_nowait())
+        except queue.Empty:
+            pass
+        if self._rate_dirty:
+            self._rate_dirty = False
+            self._render_rate_gallery()
+
         # thumbnails — each one is isolated so a single bad/corrupt image can't
         # drop the rest of the batch or (via the wrapper above) the whole poll loop.
         try:
@@ -1233,6 +1590,10 @@ class App(ctk.CTk):
             if result.path == self.current_path:
                 self._render_preview(item)
 
+    def _apply_rate_result(self, result: RatingResult):
+        self.rate_results[result.path] = result
+        self._rate_dirty = True
+
     def _set_busy(self, busy: bool, status: str = "Ready",
                   op_btn=None, op_label: str = "", op_restore: str = ""):
         self._running = busy
@@ -1242,13 +1603,14 @@ class App(ctk.CTk):
         # gains an animated spinner; the other action buttons just dim
         # to a quiet, clearly-inactive look instead of CTk's default
         # low-contrast grey-on-violet text.
-        for btn in (self.crop_btn, self.send_btn):
+        for btn in (self.crop_btn, self.rate_btn, self.send_btn):
             if busy and btn is op_btn:
                 btn.configure(state=state)  # disabled, but keeps full styling + spinner
             else:
                 btn.configure(state=state, fg_color=PANEL2 if busy else ACCENT,
                               text_color_disabled=DIM if busy else ACCENT_INK)
-        for btn in (self.add_files_btn, self.add_folder_btn, self.clear_queue_btn):
+        for btn in (self.add_files_btn, self.add_folder_btn, self.clear_queue_btn,
+                   self.rate_add_files_btn, self.rate_add_folder_btn, self.rate_clear_btn):
             btn.configure(state=state)
 
         self.status_label.configure(text=status, text_color=ACCENT if busy else MUTED)
@@ -1330,6 +1692,49 @@ class App(ctk.CTk):
             else:
                 done = total - len(failures)
                 self.after(0, lambda: self._set_busy(False, f"Done — {done}/{total} cropped"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # =======================================================================
+    # Rate operation
+    # =======================================================================
+
+    def _run_rate(self):
+        if self._running:
+            return
+        if not self.rate_paths:
+            messagebox.showwarning("No Photos", "Add some photos to rate first.")
+            return
+        api_key = self.settings.get("api_key", "").strip()
+        if not api_key:
+            messagebox.showerror("Missing API Key", "Enter your Anthropic API key in Settings.")
+            self._select_tab("Settings")
+            return
+
+        model = self.rate_model_var.get()
+        force = self.rate_force_var.get()
+        files = list(self.rate_paths)
+
+        self.progress.set(0)
+        self.progress_count.configure(text=f"0 / {len(files)}")
+        self._set_busy(True, "Rating…", op_btn=self.rate_btn,
+                       op_label="Rating", op_restore="Rate Photos")
+        self._log(f"\n═══ Rating {len(files)} photo(s) ═══")
+
+        def worker():
+            try:
+                failures, total = run_rate(
+                    inputs=files, model=model, api_key=api_key, force=force,
+                    log_fn=self._log, progress_fn=self._post_progress,
+                    result_fn=lambda r: self.rate_result_queue.put(r),
+                )
+                self._summarize(failures, total, "rated")
+            except Exception as exc:
+                self._log(f"\nUnexpected error: {exc}")
+                self.after(0, lambda: self._set_busy(False, "Error"))
+            else:
+                done = total - len(failures)
+                self.after(0, lambda: self._set_busy(False, f"Done — {done}/{total} rated"))
 
         threading.Thread(target=worker, daemon=True).start()
 

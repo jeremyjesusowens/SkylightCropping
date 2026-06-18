@@ -19,6 +19,7 @@ cost-saving choices:
 import base64
 import io
 import json
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -132,8 +133,14 @@ def load_cache() -> dict:
 
 
 def save_cache(cache: dict) -> None:
+    # Written after every rated photo (so a crash mid-run loses as little
+    # progress/spend as possible), so this must be atomic — a partial write
+    # to the real path would corrupt the whole cache, not just the latest
+    # entry.
     RATINGS_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    RATINGS_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+    tmp = RATINGS_CACHE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+    os.replace(tmp, RATINGS_CACHE_FILE)
 
 
 def _cache_key(path: Path, model: str) -> str:

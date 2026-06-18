@@ -274,9 +274,17 @@ class App(ctk.CTk):
         self.rate_paths: list[str] = []
         self.rate_results: dict[str, RatingResult] = {}
         self._rate_dirty = False
-        self._rate_thumb_cache: dict[str, ctk.CTkImage] = {}
+        self._rate_thumb_cache: "OrderedDict[str, ctk.CTkImage]" = OrderedDict()
+        self._RATE_THUMB_CACHE_MAX = 200
         self._rate_animated: set[str] = set()
         self._pulse_card = None
+        # Gallery cards are kept and repositioned across renders rather than
+        # torn down and rebuilt wholesale — see _render_rate_gallery — so a
+        # large rated library doesn't rebuild thousands of widgets on every
+        # result that comes in.
+        self._rate_cards: dict[str, ctk.CTkBaseClass] = {}
+        self._rate_card_keys: dict[str, tuple] = {}
+        self._rate_gallery_placeholder = None
         self._pulse_on = False
 
         # Fonts — humanist sans; Courier New / Menlo for mono.
@@ -302,16 +310,12 @@ class App(ctk.CTk):
 
         self._build_ui()
 
-        # Restore remembered photos (that still exist) into the queue.
-        for f in self.settings.get("crop_files", []):
-            f = str(Path(f))
-            if Path(f).exists():
-                self._add_item(f)
-        self._refresh_count()
-        if self.items:
-            self._select_item(self.items[0]["path"])
-        else:
-            self._render_preview(None)
+        # Restore remembered photos (that still exist) into the queue. Done in
+        # small chunks via `after` rather than one synchronous loop, so a
+        # large remembered queue (hundreds to thousands of rows/widgets)
+        # doesn't block the window from appearing and becoming responsive.
+        restore_paths = [str(Path(f)) for f in self.settings.get("crop_files", [])]
+        self._restore_crop_queue(restore_paths)
 
         for f in self.settings.get("rate_files", []):
             f = str(Path(f))
@@ -634,6 +638,22 @@ class App(ctk.CTk):
         self.queue_list.pack(fill="both", expand=True, padx=8, pady=(0, 10))
 
     # -- queue rows ----------------------------------------------------------
+
+    _RESTORE_CHUNK = 40
+
+    def _restore_crop_queue(self, paths: list[str], _i: int = 0):
+        chunk = paths[_i:_i + self._RESTORE_CHUNK]
+        for f in chunk:
+            if Path(f).exists():
+                self._add_item(f)
+        if _i == 0 and self.items:
+            self._select_item(self.items[0]["path"])
+        self._refresh_count()
+        next_i = _i + self._RESTORE_CHUNK
+        if next_i < len(paths):
+            self.after(1, lambda: self._restore_crop_queue(paths, next_i))
+        elif not self.items:
+            self._render_preview(None)
 
     def _add_item(self, path: str):
         if path in self.item_by_path:
@@ -1027,6 +1047,7 @@ class App(ctk.CTk):
 
         self.rate_gallery = ctk.CTkScrollableFrame(tab, fg_color="transparent")
         self.rate_gallery.grid(row=1, column=0, sticky="nsew")
+        self.rate_gallery.grid_columnconfigure(0, weight=1)
 
     def _set_rate_filter(self, key: str):
         self.rate_filter_var.set(key)
@@ -1103,6 +1124,7 @@ class App(ctk.CTk):
     def _get_rate_thumb(self, path: str):
         img = self._rate_thumb_cache.get(path)
         if img is not None:
+            self._rate_thumb_cache.move_to_end(path)
             return img
         try:
             pil = make_thumbnail(path, RATE_THUMB_SIZE)
@@ -1110,17 +1132,36 @@ class App(ctk.CTk):
             return None
         img = ctk.CTkImage(light_image=pil, dark_image=pil, size=RATE_THUMB_SIZE)
         self._rate_thumb_cache[path] = img
+        while len(self._rate_thumb_cache) > self._RATE_THUMB_CACHE_MAX:
+            self._rate_thumb_cache.popitem(last=False)
         return img
 
-    def _render_rate_gallery(self):
-        for w in self.rate_gallery.winfo_children():
-            w.destroy()
-        self._pulse_card = None
+    def _rate_card_key(self, result, is_top: bool) -> tuple:
+        """Everything that affects a card's rendered content. Re-render only
+        rebuilds the cards whose key actually changed since last time —
+        unchanged cards are just repositioned (cheap), not torn down and
+        rebuilt (expensive), which is what made a large rated library lag."""
+        if result is None:
+            return ("queued",)
+        if result.status in ("analyzing", "failed"):
+            return (result.status, result.error)
+        return ("rated", result.score, result.headline, result.feedback,
+                tuple(result.tags), tuple(tuple(sorted(c.items())) for c in (result.categories or [])),
+                result.cached, is_top)
 
+    def _render_rate_gallery(self):
         if not self.rate_paths:
-            ctk.CTkLabel(self.rate_gallery, text="Add photos above and hit Rate Photos —\n"
-                        "Claude will score each one and leave a one-line review.",
-                        font=self.f_label, text_color=DIM, justify="center").pack(pady=60)
+            for w in self.rate_gallery.winfo_children():
+                w.destroy()
+            self._rate_cards.clear()
+            self._rate_card_keys.clear()
+            self._pulse_card = None
+            self._rate_gallery_placeholder = ctk.CTkLabel(
+                self.rate_gallery,
+                text="Add photos above and hit Rate Photos —\n"
+                     "Claude will score each one and leave a one-line review.",
+                font=self.f_label, text_color=DIM, justify="center")
+            self._rate_gallery_placeholder.grid(row=0, column=0, pady=60)
             return
 
         paths = list(self.rate_paths)
@@ -1137,50 +1178,84 @@ class App(ctk.CTk):
             if r and r.status == "rated" and r.score is not None and r.score > top_score:
                 top_score, top_path = r.score, p
 
-        shown_any = False
+        shown = []
         for path in paths:
             result = self.rate_results.get(path)
             if filter_key != "all" and (not result or result.status != "rated"
                                         or score_tier(result.score) != filter_key):
                 continue
-            shown_any = True
-            self._build_rate_card(path, result, is_top=(path == top_path and top_score >= 70))
+            shown.append(path)
 
-        if not shown_any:
-            ctk.CTkLabel(self.rate_gallery, text="No photos match this filter yet.",
-                        font=self.f_label, text_color=DIM).pack(pady=40)
+        if self._rate_gallery_placeholder is not None:
+            self._rate_gallery_placeholder.destroy()
+            self._rate_gallery_placeholder = None
 
-    def _build_rate_card(self, path: str, result, is_top: bool):
+        if not shown:
+            for path, card in self._rate_cards.items():
+                card.destroy()
+            self._rate_cards.clear()
+            self._rate_card_keys.clear()
+            self._pulse_card = None
+            self._rate_gallery_placeholder = ctk.CTkLabel(
+                self.rate_gallery, text="No photos match this filter yet.",
+                font=self.f_label, text_color=DIM)
+            self._rate_gallery_placeholder.grid(row=0, column=0, pady=40)
+            return
+
+        shown_set = set(shown)
+        for path in list(self._rate_cards):
+            if path not in shown_set:
+                self._rate_cards.pop(path).destroy()
+                self._rate_card_keys.pop(path, None)
+
+        self._pulse_card = None
+        for row, path in enumerate(shown):
+            result = self.rate_results.get(path)
+            is_top = path == top_path and top_score >= 70
+            key = self._rate_card_key(result, is_top)
+            card = self._rate_cards.get(path)
+            if card is None or self._rate_card_keys.get(path) != key:
+                if card is not None:
+                    card.destroy()
+                card = self._build_rate_card(path, result, is_top, row)
+                self._rate_cards[path] = card
+                self._rate_card_keys[path] = key
+            else:
+                card.grid(row=row, column=0)
+            if is_top and result is not None and result.status == "rated":
+                self._pulse_card = card
+
+    def _build_rate_card(self, path: str, result, is_top: bool, row: int):
         name = Path(path).name
         if result is None:
             card = ctk.CTkFrame(self.rate_gallery, corner_radius=10, fg_color=PANEL,
                                 border_width=1, border_color=STROKE)
-            card.pack(fill="x", pady=5, padx=2)
+            card.grid(row=row, column=0, sticky="ew", pady=5, padx=2)
             ctk.CTkLabel(card, text=f"●  {name}", font=self.f_mono, text_color=DIM,
                         anchor="w").pack(side="left", padx=14, pady=14)
             ctk.CTkLabel(card, text="queued", font=self.f_small, text_color=DIM).pack(
                 side="right", padx=14)
-            return
+            return card
 
         if result.status == "analyzing":
             card = ctk.CTkFrame(self.rate_gallery, corner_radius=10, fg_color=PANEL,
                                 border_width=1, border_color=ACCENT)
-            card.pack(fill="x", pady=5, padx=2)
+            card.grid(row=row, column=0, sticky="ew", pady=5, padx=2)
             ctk.CTkLabel(card, text=f"⠿  {name}", font=self.f_mono, text_color=TXT,
                         anchor="w").pack(side="left", padx=14, pady=14)
             ctk.CTkLabel(card, text="analyzing…", font=self.f_small, text_color=ACCENT).pack(
                 side="right", padx=14)
-            return
+            return card
 
         if result.status == "failed":
             card = ctk.CTkFrame(self.rate_gallery, corner_radius=10, fg_color=PANEL,
                                 border_width=1, border_color=ERRC)
-            card.pack(fill="x", pady=5, padx=2)
+            card.grid(row=row, column=0, sticky="ew", pady=5, padx=2)
             ctk.CTkLabel(card, text=f"✗  {name}", font=self.f_mono, text_color=ERRC,
                         anchor="w").pack(side="left", padx=14, pady=14)
             ctk.CTkLabel(card, text=result.error or "failed", font=self.f_small,
                         text_color=ERRC, wraplength=260).pack(side="right", padx=14)
-            return
+            return card
 
         # rated — the flashy card
         tier = score_tier(result.score)
@@ -1188,10 +1263,8 @@ class App(ctk.CTk):
         border_w = 3 if is_top else 2
         card = ctk.CTkFrame(self.rate_gallery, corner_radius=16, fg_color=PANEL,
                             border_width=border_w, border_color=color)
-        card.pack(fill="x", pady=8, padx=2)
+        card.grid(row=row, column=0, sticky="ew", pady=8, padx=2)
         card.grid_columnconfigure(1, weight=1)
-        if is_top:
-            self._pulse_card = card
 
         thumb_img = self._get_rate_thumb(path)
         thumb_lbl = ctk.CTkLabel(card, text="" if thumb_img else "📷", image=thumb_img,
@@ -1247,6 +1320,7 @@ class App(ctk.CTk):
             ctk.CTkLabel(card, text="from cache · no API cost", font=self.f_small,
                         text_color=DIM).grid(row=1, column=1, sticky="w", padx=(0, 14),
                                              pady=(0, 10))
+        return card
 
     def _draw_score_ring(self, canvas: tk.Canvas, value: int, color: str, pad: int = 6):
         canvas.delete("all")
@@ -1664,8 +1738,11 @@ class App(ctk.CTk):
 
         # thumbnails — each one is isolated so a single bad/corrupt image can't
         # drop the rest of the batch or (via the wrapper above) the whole poll loop.
+        # Capped per tick so a large queue (the worker can stay far ahead of the
+        # UI) doesn't dump hundreds of CTkImage creations into a single tick and
+        # stall the UI thread.
         try:
-            while True:
+            for _ in range(self._THUMB_APPLY_PER_TICK):
                 path, pil = self.thumb_ready.get_nowait()
                 item = self.item_by_path.get(path)
                 if item:
@@ -1677,6 +1754,10 @@ class App(ctk.CTk):
                         pass
         except queue.Empty:
             pass
+
+    # How many ready thumbnails to apply to the UI per poll tick (see
+    # _poll_queues_once) — bounds how much work one tick can do.
+    _THUMB_APPLY_PER_TICK = 25
 
     # How long to linger on a finished photo's crop preview before jumping to
     # the next one that has started analyzing (ms).

@@ -13,7 +13,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
-from collections import Counter
+from collections import Counter, OrderedDict
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
@@ -259,8 +259,11 @@ class App(ctk.CTk):
         self.item_by_path: dict[str, dict] = {}
         self.current_path: str | None = None
 
-        # Preview / thumbnail caches.
-        self._preview_cache: dict[str, tuple[Image.Image, tuple[int, int]]] = {}
+        # Preview / thumbnail caches. Bounded so a large queue (hundreds to
+        # thousands of photos cycling through "analyzing" during a crop run)
+        # can't pin gigabytes of decoded RGB copies in memory.
+        self._preview_cache: "OrderedDict[str, tuple[Image.Image, tuple[int, int]]]" = OrderedDict()
+        self._PREVIEW_CACHE_MAX = 24
         self._tk_preview = None          # keep a ref so it isn't GC'd
         self._resize_after = None
         self.thumb_jobs: queue.Queue[str] = queue.Queue()
@@ -759,6 +762,7 @@ class App(ctk.CTk):
     def _get_preview_image(self, path: str):
         cached = self._preview_cache.get(path)
         if cached:
+            self._preview_cache.move_to_end(path)
             return cached
         with Image.open(path) as im:
             im = ImageOps.exif_transpose(im).convert("RGB")
@@ -769,6 +773,8 @@ class App(ctk.CTk):
             else:
                 im = im.copy()
         self._preview_cache[path] = (im, orig)
+        while len(self._preview_cache) > self._PREVIEW_CACHE_MAX:
+            self._preview_cache.popitem(last=False)
         return self._preview_cache[path]
 
     def _render_preview(self, item):
@@ -1499,6 +1505,7 @@ class App(ctk.CTk):
             it["row"].destroy()
         self.items.clear()
         self.item_by_path.clear()
+        self._preview_cache.clear()
         self.current_path = None
         self._refresh_count()
         self._persist_paths()

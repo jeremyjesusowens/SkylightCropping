@@ -20,7 +20,7 @@ echo.
 
 echo Building executable...
 pyinstaller ^
-  --onefile ^
+  --onedir ^
   --windowed ^
   --collect-data customtkinter ^
   --add-data "assets;assets" ^
@@ -30,10 +30,10 @@ pyinstaller ^
   app.py
 
 echo.
-if exist "dist\SkylightCropping.exe" (
+if exist "dist\SkylightCropping\SkylightCropping.exe" (
     echo =====================================================
     echo  Build successful!
-    echo  Executable: dist\SkylightCropping.exe
+    echo  Executable: dist\SkylightCropping\SkylightCropping.exe
     echo =====================================================
 ) else (
     echo =====================================================

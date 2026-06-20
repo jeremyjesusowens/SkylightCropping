@@ -43,10 +43,10 @@ The **Send** tab emails each cropped photo as an individual message — handy fo
 
 No Python, no building required.
 
-- **Latest release:** go to the repo's **Releases** page and download `SkylightCropping.exe` (Windows) or `SkylightCropping` (macOS).
-- **Latest build:** open the **Actions** tab → most recent "Build App" run → download the **SkylightCropping** or **SkylightCropping-mac** artifact. Build artifacts are kept for 7 days; tagged releases are permanent.
+- **Latest release:** go to the repo's **Releases** page and download `SkylightCropping-windows.zip` (Windows) or `SkylightCropping` (macOS).
+- **Latest build:** open the **Actions** tab → most recent "Build App" run → download the **SkylightCropping-windows** or **SkylightCropping-mac** artifact. Build artifacts are kept for 7 days; tagged releases are permanent.
 
-Just run the downloaded binary — nothing to install.
+On Windows, unzip the download and run `SkylightCropping.exe` from inside the extracted folder. On macOS, just run the downloaded binary — nothing to install.
 
 ### Option B — run from source
 
@@ -63,7 +63,7 @@ Just run the downloaded binary — nothing to install.
 ### Option C — build the binary locally
 
 ```
-build.bat       # Windows → dist\SkylightCropping.exe
+build.bat       # Windows → dist\SkylightCropping\SkylightCropping.exe
 ```
 
 ---

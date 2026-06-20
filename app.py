@@ -74,8 +74,7 @@ def _timed_import(name: str):
 
 
 try:
-    keyring = _timed_import("keyring")
-    import keyring.errors
+    keyring = _timed_import("keyring.errors")
     _KEYRING_AVAILABLE = True
 except Exception:
     log.warning("keyring unavailable — secrets will be stored in plaintext settings.json")

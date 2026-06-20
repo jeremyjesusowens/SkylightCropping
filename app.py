@@ -7,23 +7,81 @@ item in the queue can be clicked to review its crop during or after processing.
 """
 
 import json
+import logging
+import logging.handlers
 import os
 import queue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from collections import Counter, OrderedDict
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
+_SETTINGS_DIR = (
+    Path.home() / "Library" / "Application Support" / "SkylightCropping"
+    if sys.platform == "darwin"
+    else Path.home() / ".skylight_cropping"
+)
+LOG_FILE = _SETTINGS_DIR / "app.log"
+
+
+def _setup_logging() -> logging.Logger:
+    """Set up file logging before anything else runs.
+
+    The packaged build is a --windowed PyInstaller exe with no console, so
+    stdout/stderr (and Tk's default callback-exception printing) go nowhere
+    visible. This gives startup hangs and crashes somewhere to land.
+    """
+    _SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+    log = logging.getLogger("skylight")
+    log.setLevel(logging.DEBUG)
+    handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-7s [%(threadName)s] %(message)s"
+    ))
+    log.addHandler(handler)
+
+    def _log_uncaught(exc_type, exc_value, exc_tb):
+        log.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _log_uncaught
+    log.info("=" * 60)
+    log.info(
+        "Starting Skylight Cropping — python=%s platform=%s frozen=%s",
+        sys.version.split()[0], sys.platform, getattr(sys, "frozen", False),
+    )
+    return log
+
+
+log = _setup_logging()
+
+
+def _timed_import(name: str):
+    t0 = time.monotonic()
+    try:
+        module = __import__(name)
+        log.debug("Imported %s in %.2fs", name, time.monotonic() - t0)
+        return module
+    except Exception:
+        log.exception("Failed to import %s after %.2fs", name, time.monotonic() - t0)
+        raise
+
+
 try:
-    import keyring
+    keyring = _timed_import("keyring")
     import keyring.errors
     _KEYRING_AVAILABLE = True
 except Exception:
+    log.warning("keyring unavailable — secrets will be stored in plaintext settings.json")
     _KEYRING_AVAILABLE = False
 
+_timed_import("customtkinter")
 import customtkinter as ctk
 from PIL import Image, ImageOps, ImageTk
 
@@ -66,11 +124,6 @@ from rate_photos import (RATE_MODELS, DEFAULT_RATE_MODEL, RatingResult,
 # Settings persistence
 # ---------------------------------------------------------------------------
 
-_SETTINGS_DIR = (
-    Path.home() / "Library" / "Application Support" / "SkylightCropping"
-    if sys.platform == "darwin"
-    else Path.home() / ".skylight_cropping"
-)
 SETTINGS_FILE = _SETTINGS_DIR / "settings.json"
 DEFAULT_TO = ""  # set your Skylight frame's email address in the app Settings
 
@@ -81,15 +134,20 @@ _KEYRING_KEYS = {"api_key", "smtp_password"}
 def _kr_get(key: str) -> str:
     if not _KEYRING_AVAILABLE:
         return ""
+    t0 = time.monotonic()
     try:
-        return keyring.get_password(_KEYRING_SERVICE, key) or ""
+        value = keyring.get_password(_KEYRING_SERVICE, key) or ""
+        log.debug("keyring.get_password(%s) took %.2fs", key, time.monotonic() - t0)
+        return value
     except Exception:
+        log.exception("keyring.get_password(%s) failed after %.2fs", key, time.monotonic() - t0)
         return ""
 
 
 def _kr_set(key: str, value: str) -> bool:
     if not _KEYRING_AVAILABLE:
         return False
+    t0 = time.monotonic()
     try:
         if value:
             keyring.set_password(_KEYRING_SERVICE, key, value)
@@ -98,8 +156,10 @@ def _kr_set(key: str, value: str) -> bool:
                 keyring.delete_password(_KEYRING_SERVICE, key)
             except keyring.errors.PasswordDeleteError:
                 pass
+        log.debug("keyring.set_password(%s) took %.2fs", key, time.monotonic() - t0)
         return True
     except Exception:
+        log.exception("keyring.set_password(%s) failed after %.2fs", key, time.monotonic() - t0)
         return False
 
 # --- Aurora / Twilight palette ---------------------------------------------
@@ -180,6 +240,7 @@ def _open_folder(path: Path) -> None:
 
 
 def load_settings() -> dict:
+    t0 = time.monotonic()
     defaults = {
         "api_key": "",
         "smtp_password": "",
@@ -202,12 +263,13 @@ def load_settings() -> dict:
         try:
             defaults.update(json.loads(SETTINGS_FILE.read_text(encoding="utf-8")))
         except Exception:
-            pass
+            log.exception("Failed to parse %s — using defaults", SETTINGS_FILE)
     # Keyring values take precedence over any plaintext remnants in the JSON file.
     for key in _KEYRING_KEYS:
         kr_val = _kr_get(key)
         if kr_val:
             defaults[key] = kr_val
+    log.info("load_settings() took %.2fs", time.monotonic() - t0)
     return defaults
 
 
@@ -226,7 +288,14 @@ def save_settings(settings: dict) -> None:
 # ---------------------------------------------------------------------------
 
 class App(ctk.CTk):
+    def report_callback_exception(self, exc_type, exc_value, exc_tb):
+        """Tk swallows callback exceptions and prints to stderr by default,
+        which is invisible in a --windowed build with no console."""
+        log.error("Tk callback exception", exc_info=(exc_type, exc_value, exc_tb))
+
     def __init__(self):
+        t0 = time.monotonic()
+        log.info("App.__init__ starting")
         super().__init__()
         self.title("Skylight Cropping")
         self.geometry("1200x920")
@@ -242,6 +311,7 @@ class App(ctk.CTk):
             self.iconphoto(True, _icon_img)
             self._app_icon = _icon_img  # prevent GC
 
+        log.debug("Tk window + icon ready at %.2fs", time.monotonic() - t0)
         self.settings = load_settings()
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.progress_queue: queue.Queue[tuple[int, int]] = queue.Queue()
@@ -307,7 +377,9 @@ class App(ctk.CTk):
         self.f_mono    = ctk.CTkFont(family=MONO_F, size=12)
         self.f_emoji   = ctk.CTkFont(family=EMOJI_F, size=12)
 
+        log.debug("Settings loaded + fonts ready at %.2fs", time.monotonic() - t0)
         self._build_ui()
+        log.debug("_build_ui done at %.2fs", time.monotonic() - t0)
 
         for f in self.settings.get("rate_files", []):
             f = str(Path(f))
@@ -315,6 +387,7 @@ class App(ctk.CTk):
                 self.rate_paths.append(f)
         self._refresh_rate_count()
         self._render_rate_gallery()
+        log.debug("Rate gallery rendered at %.2fs", time.monotonic() - t0)
 
         threading.Thread(target=self._thumb_worker, daemon=True).start()
         self._poll_queues()
@@ -323,6 +396,8 @@ class App(ctk.CTk):
 
         if self.settings.get("api_key", "").strip():
             self._refresh_models(silent=True)
+
+        log.info("App.__init__ finished in %.2fs", time.monotonic() - t0)
 
     # =======================================================================
     # Layout
@@ -460,6 +535,10 @@ class App(ctk.CTk):
         self.progress_count.grid(row=0, column=1, sticky="e")
         ctk.CTkLabel(row, text=APP_VERSION, anchor="e",
                      font=self.f_small, text_color=MUTED).grid(row=0, column=2, sticky="e", padx=(12, 0))
+        log_link = ctk.CTkLabel(row, text="Open log", anchor="e", cursor="hand2",
+                                font=self.f_small, text_color=MUTED)
+        log_link.grid(row=0, column=3, sticky="e", padx=(12, 0))
+        log_link.bind("<Button-1>", lambda e: _open_folder(LOG_FILE.parent))
 
         self.progress = ctk.CTkProgressBar(footer, height=8, corner_radius=4,
                                            progress_color=ACCENT, fg_color=PANEL2)
@@ -1624,7 +1703,13 @@ class App(ctk.CTk):
             self.status_label.configure(text="Fetching available models…")
 
         def worker():
-            models = list_models(api_key)
+            t0 = time.monotonic()
+            try:
+                models = list_models(api_key)
+                log.debug("list_models() returned %d models in %.2fs", len(models), time.monotonic() - t0)
+            except Exception:
+                log.exception("list_models() failed after %.2fs", time.monotonic() - t0)
+                return
             self.after(0, lambda: self._apply_models(models, silent))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -2013,9 +2098,17 @@ class App(ctk.CTk):
 # ---------------------------------------------------------------------------
 
 def main():
-    ctk.set_appearance_mode("dark")
-    ctk.set_default_color_theme("blue")
-    App().mainloop()
+    log.info("Log file: %s", LOG_FILE)
+    try:
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
+        app = App()
+        log.info("Entering mainloop")
+        app.mainloop()
+        log.info("mainloop exited normally")
+    except Exception:
+        log.exception("Fatal error during startup")
+        raise
 
 
 if __name__ == "__main__":

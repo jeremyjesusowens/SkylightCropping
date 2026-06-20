@@ -5,8 +5,13 @@ echo =====================================================
 echo.
 
 echo Installing / updating dependencies...
-pip install -r requirements.txt
-pip install pyinstaller
+where uv >nul 2>nul
+if %ERRORLEVEL% == 0 (
+    uv pip install --system -r requirements.txt pyinstaller
+) else (
+    pip install -r requirements.txt
+    pip install pyinstaller
+)
 echo.
 
 echo Recording build version...

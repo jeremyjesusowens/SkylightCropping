@@ -192,7 +192,6 @@ def load_settings() -> dict:
         "model": "claude-opus-4-7",
         "output_suffix": "_16x9",
         # remembered between sessions
-        "crop_files": [],
         "crop_output_dir": "",
         "send_dir": "",
         "model_list": list(FALLBACK_MODELS),
@@ -309,13 +308,6 @@ class App(ctk.CTk):
         self.f_emoji   = ctk.CTkFont(family=EMOJI_F, size=12)
 
         self._build_ui()
-
-        # Restore remembered photos (that still exist) into the queue. Done in
-        # small chunks via `after` rather than one synchronous loop, so a
-        # large remembered queue (hundreds to thousands of rows/widgets)
-        # doesn't block the window from appearing and becoming responsive.
-        restore_paths = [str(Path(f)) for f in self.settings.get("crop_files", [])]
-        self._restore_crop_queue(restore_paths)
 
         for f in self.settings.get("rate_files", []):
             f = str(Path(f))
@@ -638,22 +630,6 @@ class App(ctk.CTk):
         self.queue_list.pack(fill="both", expand=True, padx=8, pady=(0, 10))
 
     # -- queue rows ----------------------------------------------------------
-
-    _RESTORE_CHUNK = 40
-
-    def _restore_crop_queue(self, paths: list[str], _i: int = 0):
-        chunk = paths[_i:_i + self._RESTORE_CHUNK]
-        for f in chunk:
-            if Path(f).exists():
-                self._add_item(f)
-        if _i == 0 and self.items:
-            self._select_item(self.items[0]["path"])
-        self._refresh_count()
-        next_i = _i + self._RESTORE_CHUNK
-        if next_i < len(paths):
-            self.after(1, lambda: self._restore_crop_queue(paths, next_i))
-        elif not self.items:
-            self._render_preview(None)
 
     def _add_item(self, path: str):
         if path in self.item_by_path:
@@ -1610,7 +1586,6 @@ class App(ctk.CTk):
             btn.configure(text="Show")
 
     def _persist_paths(self):
-        self.settings["crop_files"] = [it["path"] for it in self.items]
         self.settings["crop_output_dir"] = self.output_dir_var.get().strip()
         self.settings["send_dir"] = self.send_dir_var.get().strip()
         self.settings["rate_files"] = list(self.rate_paths)

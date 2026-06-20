@@ -81,6 +81,33 @@ jobs:
         shell: cmd
         run: build.bat
 
+      - name: Smoke test executable
+        shell: pwsh
+        run: |
+          $proc = Start-Process -FilePath "dist\SkylightCropping.exe" -PassThru
+          $timeoutSeconds = 20
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          $windowFound = $false
+          while ($sw.Elapsed.TotalSeconds -lt $timeoutSeconds) {
+            $proc.Refresh()
+            if ($proc.HasExited) {
+              Write-Error "App exited unexpectedly after $($sw.Elapsed.TotalSeconds.ToString('0.0'))s (exit code $($proc.ExitCode))"
+              exit 1
+            }
+            if ($proc.MainWindowHandle -ne 0) {
+              $windowFound = $true
+              break
+            }
+            Start-Sleep -Milliseconds 500
+          }
+          if (-not $windowFound) {
+            Stop-Process -Id $proc.Id -Force
+            Write-Error "App did not open a window within $timeoutSeconds seconds"
+            exit 1
+          }
+          Write-Host "App window appeared after $($sw.Elapsed.TotalSeconds.ToString('0.0'))s"
+          Stop-Process -Id $proc.Id -Force
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
@@ -104,6 +131,18 @@ jobs:
 
       - name: Build executable
         run: bash build.sh
+
+      - name: Smoke test executable
+        run: |
+          ./dist/SkylightCropping &
+          pid=$!
+          sleep 10
+          if ! kill -0 "$pid" 2>/dev/null; then
+            echo "App exited unexpectedly within 10s" >&2
+            exit 1
+          fi
+          echo "App still running after 10s"
+          kill "$pid"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

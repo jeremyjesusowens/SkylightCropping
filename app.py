@@ -1263,7 +1263,25 @@ class App(ctk.CTk):
                 self._rate_card_keys.pop(path, None)
 
         self._pulse_card = None
-        for row, path in enumerate(shown):
+        # Card creation is real Tk widget work (each rated card is several
+        # canvas-drawn CTk widgets), so a large library — hundreds or
+        # thousands of queued files — can take long enough to build that
+        # Windows flags the whole app as "Not Responding". Build in small
+        # batches via `after` so the event loop keeps pumping between them.
+        # A token guards against a stale batch run continuing after a newer
+        # _render_rate_gallery() call (e.g. the user changed the filter)
+        # has already started its own batches.
+        self._rate_render_token = getattr(self, "_rate_render_token", 0) + 1
+        self._render_rate_gallery_chunk(shown, top_path, top_score, 0, self._rate_render_token)
+
+    _RATE_RENDER_CHUNK = 40
+
+    def _render_rate_gallery_chunk(self, shown, top_path, top_score, start, token):
+        if token != self._rate_render_token:
+            return
+        end = min(start + self._RATE_RENDER_CHUNK, len(shown))
+        for row in range(start, end):
+            path = shown[row]
             result = self.rate_results.get(path)
             is_top = path == top_path and top_score >= 70
             key = self._rate_card_key(result, is_top)
@@ -1278,6 +1296,9 @@ class App(ctk.CTk):
                 card.grid(row=row, column=0)
             if is_top and result is not None and result.status == "rated":
                 self._pulse_card = card
+        if end < len(shown):
+            self.after(1, lambda: self._render_rate_gallery_chunk(
+                shown, top_path, top_score, end, token))
 
     def _build_rate_card(self, path: str, result, is_top: bool, row: int):
         name = Path(path).name

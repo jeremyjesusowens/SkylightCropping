@@ -340,6 +340,7 @@ class App(ctk.CTk):
 
         # Rate tab state — separate from the crop queue above by design.
         self.rate_paths: list[str] = []
+        self._rate_gallery_hydrated = False
         self.rate_results: dict[str, RatingResult] = {}
         self._rate_dirty = False
         self._rate_thumb_cache: "OrderedDict[str, ctk.CTkImage]" = OrderedDict()
@@ -380,13 +381,12 @@ class App(ctk.CTk):
         self._build_ui()
         log.debug("_build_ui done at %.2fs", time.monotonic() - t0)
 
-        for f in self.settings.get("rate_files", []):
-            f = str(Path(f))
-            if Path(f).exists() and f not in self.rate_paths:
-                self.rate_paths.append(f)
+        # Remembered rate files can number in the thousands after a folder
+        # import; checking existence and rendering the gallery for all of
+        # them up front used to block startup. Defer it to the first time
+        # the Rate tab is actually opened (see _select_tab).
         self._refresh_rate_count()
-        self._render_rate_gallery()
-        log.debug("Rate gallery rendered at %.2fs", time.monotonic() - t0)
+        log.debug("Rate gallery hydration deferred at %.2fs", time.monotonic() - t0)
 
         threading.Thread(target=self._thumb_worker, daemon=True).start()
         self._poll_queues()
@@ -561,6 +561,8 @@ class App(ctk.CTk):
         self.log_box.grid(row=3, column=0, sticky="ew", padx=18, pady=(4, 12))
 
     def _select_tab(self, name: str):
+        if name == "Rate" and not self._rate_gallery_hydrated:
+            self._hydrate_rate_gallery()
         self.frames[name].tkraise()
         for n, b in self.nav_btns.items():
             active = n == name
@@ -1164,7 +1166,31 @@ class App(ctk.CTk):
         self._persist_paths()
 
     def _refresh_rate_count(self):
-        self.rate_count_label.configure(text=f"{len(self.rate_paths)} queued")
+        if self._rate_gallery_hydrated:
+            n = len(self.rate_paths)
+        else:
+            n = len(self.settings.get("rate_files", []))
+        self.rate_count_label.configure(text=f"{n} queued")
+
+    def _hydrate_rate_gallery(self):
+        """Check remembered rate files against disk and render the gallery.
+
+        Deferred until the Rate tab is first opened — done eagerly in
+        __init__ this used to mean checking the existence of (and persisting)
+        every remembered file on every launch, which could number in the
+        thousands after a folder import and made the whole app appear to
+        hang before the window even showed up.
+        """
+        self._rate_gallery_hydrated = True
+        for f in self.settings.get("rate_files", []):
+            f = str(Path(f))
+            if Path(f).exists() and f not in self.rate_paths:
+                self.rate_paths.append(f)
+        # Drop dead entries permanently so the remembered list can't grow
+        # forever — moved/deleted files no longer come back from disk.
+        self._persist_paths()
+        self._refresh_rate_count()
+        self._render_rate_gallery()
 
     def _clear_ratings_cache(self):
         if messagebox.askyesno("Clear Ratings Cache",
@@ -1687,7 +1713,11 @@ class App(ctk.CTk):
     def _persist_paths(self):
         self.settings["crop_output_dir"] = self.output_dir_var.get().strip()
         self.settings["send_dir"] = self.send_dir_var.get().strip()
-        self.settings["rate_files"] = list(self.rate_paths)
+        # Rate gallery hydration is deferred until the Rate tab is first
+        # opened (see _hydrate_rate_gallery); don't clobber the saved
+        # rate_files list with an empty in-memory one before that happens.
+        if self._rate_gallery_hydrated:
+            self.settings["rate_files"] = list(self.rate_paths)
         self.settings["rate_model"] = self.rate_model_var.get()
         save_settings(self.settings)
 

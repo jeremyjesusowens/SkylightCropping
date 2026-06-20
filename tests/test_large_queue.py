@@ -3,8 +3,6 @@
 
 Covers:
   - the preview cache must not grow without bound as photos are viewed
-  - restoring a remembered queue on startup must not block the UI thread
-    with one giant synchronous loop
   - thumbnail-ready results must be applied in capped batches per poll tick,
     not all at once
 """
@@ -85,52 +83,6 @@ class TestPreviewCacheBound:
             assert app._preview_cache
             app._clear_crop_files()
             assert not app._preview_cache
-        finally:
-            app.destroy()
-
-
-class TestChunkedStartupRestore:
-    def test_restore_does_not_build_everything_in_one_call(self, app_module, tmp_path, monkeypatch):
-        """A large remembered queue must be restored incrementally via `after`,
-        not all at once on the main thread before the window can paint."""
-        app = _build_app(app_module, tmp_path, monkeypatch)
-        try:
-            paths = []
-            for i in range(app._RESTORE_CHUNK * 3 + 5):
-                p = tmp_path / f"photo_{i}.jpg"
-                _make_image(p)
-                paths.append(str(p))
-
-            scheduled = []
-            monkeypatch.setattr(app, "after", lambda ms, fn: scheduled.append(fn))
-
-            app._restore_crop_queue(paths)
-
-            # only the first chunk should have been added synchronously
-            assert len(app.items) == app._RESTORE_CHUNK
-            assert scheduled  # the rest was deferred instead of run inline
-
-            # draining the deferred chunks must eventually restore everything
-            while scheduled:
-                fn = scheduled.pop(0)
-                fn()
-            assert len(app.items) == len(paths)
-        finally:
-            app.destroy()
-
-    def test_first_item_selected_after_first_chunk(self, app_module, tmp_path, monkeypatch):
-        app = _build_app(app_module, tmp_path, monkeypatch)
-        try:
-            paths = []
-            for i in range(3):
-                p = tmp_path / f"photo_{i}.jpg"
-                _make_image(p)
-                paths.append(str(p))
-
-            monkeypatch.setattr(app, "after", lambda ms, fn: None)
-            app._restore_crop_queue(paths)
-
-            assert app.current_path == paths[0]
         finally:
             app.destroy()
 

@@ -97,6 +97,21 @@ Click **Save Settings**. No environment variables needed. The app remembers your
 
 ---
 
+## Troubleshooting
+
+The packaged app runs windowed (no console), so if it hangs on startup or
+crashes silently, check the log file instead:
+
+- **Windows / Linux:** `%USERPROFILE%\.skylight_cropping\app.log`
+- **macOS:** `~/Library/Application Support/SkylightCropping/app.log`
+
+Click **Open log** in the bottom-right of the app window to jump straight to
+the folder. The log records startup timing (settings load, keyring access,
+UI build) plus any uncaught exceptions or Tk callback errors, which is the
+most useful thing to attach when reporting a bug.
+
+---
+
 ## Supported formats
 
 JPEG · PNG · WebP · GIF

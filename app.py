@@ -315,6 +315,7 @@ class App(ctk.CTk):
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.progress_queue: queue.Queue[tuple[int, int]] = queue.Queue()
         self.result_queue: queue.Queue = queue.Queue()
+        self.send_result_queue: queue.Queue = queue.Queue()
         self.rate_result_queue: queue.Queue = queue.Queue()
         self._running = False
         self._spinner_btn = None
@@ -327,6 +328,12 @@ class App(ctk.CTk):
         self.item_by_path: dict[str, dict] = {}
         self.current_path: str | None = None
 
+        # Send queue model — mirrors the crop queue above but is populated
+        # by scanning the chosen send folder rather than manual add/remove.
+        self.send_items: list[dict] = []
+        self.send_item_by_path: dict[str, dict] = {}
+        self.send_current_path: str | None = None
+
         # Preview / thumbnail caches. Bounded so a large queue (hundreds to
         # thousands of photos cycling through "analyzing" during a crop run)
         # can't pin gigabytes of decoded RGB copies in memory.
@@ -334,6 +341,8 @@ class App(ctk.CTk):
         self._PREVIEW_CACHE_MAX = 24
         self._tk_preview = None          # keep a ref so it isn't GC'd
         self._resize_after = None
+        self._tk_send_preview = None     # keep a ref so it isn't GC'd
+        self._send_resize_after = None
         self.thumb_jobs: queue.Queue[str] = queue.Queue()
         self.thumb_ready: queue.Queue[tuple[str, Image.Image]] = queue.Queue()
         self._thumb_requested: set[str] = set()
@@ -711,10 +720,11 @@ class App(ctk.CTk):
 
     # -- queue rows ----------------------------------------------------------
 
-    def _add_item(self, path: str):
-        if path in self.item_by_path:
-            return
-        row = ctk.CTkFrame(self.queue_list, fg_color="transparent", corner_radius=8,
+    def _build_queue_row(self, parent, path: str, select_cb, current_getter) -> dict:
+        """Build one queue-list row. Shared by the crop and send queues —
+        only the parent list, click handler, and "what's selected" lookup
+        differ between them."""
+        row = ctk.CTkFrame(parent, fg_color="transparent", corner_radius=8,
                            height=72)
         row.pack(fill="x", pady=2)
         row.pack_propagate(False)
@@ -744,20 +754,26 @@ class App(ctk.CTk):
                 "subject_emoji_lbl": subject_emoji_lbl, "subject_lbl": subject_lbl,
                 "size_lbl": size_lbl, "thumb_img": None}
         for w in (row, thumb, name, status, subject_emoji_lbl, subject_lbl, size_lbl):
-            w.bind("<Button-1>", lambda e, p=path: self._select_item(p))
-            w.bind("<Enter>", lambda e, it=item: self._row_hover(it, True))
-            w.bind("<Leave>", lambda e, it=item: self._row_hover(it, False))
+            w.bind("<Button-1>", lambda e, p=path: select_cb(p))
+            w.bind("<Enter>", lambda e, it=item: self._row_hover(it, True, current_getter))
+            w.bind("<Leave>", lambda e, it=item: self._row_hover(it, False, current_getter))
+        return item
 
+    def _add_item(self, path: str):
+        if path in self.item_by_path:
+            return
+        item = self._build_queue_row(self.queue_list, path, self._select_item,
+                                      lambda: self.current_path)
         self.items.append(item)
         self.item_by_path[path] = item
         self._request_thumb(path)
 
-    def _row_hover(self, item, on):
-        if item["path"] == self.current_path:
+    def _row_hover(self, item, on, current_getter):
+        if item["path"] == current_getter():
             return
         item["row"].configure(fg_color=HOVER if on else "transparent")
 
-    def _update_row(self, item):
+    def _update_row(self, item, current_path: str | None = None):
         result = item.get("result")
         status_map = {
             "queued":    ("● queued", DIM),
@@ -765,6 +781,8 @@ class App(ctk.CTk):
             "analyzing": ("● analyzing…", ACCENT),
             "cropped":   ("● cropped", DONE),
             "dry_run":   ("● preview ready", DONE),
+            "sending":   ("● sending…", ACCENT),
+            "sent":      ("● sent", DONE),
             "failed":    ("● failed", ERRC),
         }
         text, color = status_map.get(item["status"], ("● queued", DIM))
@@ -773,7 +791,7 @@ class App(ctk.CTk):
             color = WARN
         item["status_lbl"].configure(text=text, text_color=color)
         item["name"].configure(
-            text_color=TXT if item["path"] == self.current_path else MUTED)
+            text_color=TXT if item["path"] == current_path else MUTED)
 
         # Subject label — shown once a crop result is available
         if result and result.subject and item["status"] in ("cropped", "dry_run"):
@@ -809,6 +827,40 @@ class App(ctk.CTk):
     def _refresh_count(self):
         self.queue_count.configure(text=str(len(self.items)))
 
+    # -- send queue ------------------------------------------------------------
+
+    def _add_send_item(self, path: str):
+        if path in self.send_item_by_path:
+            return
+        item = self._build_queue_row(self.send_queue_list, path, self._select_send_item,
+                                      lambda: self.send_current_path)
+        self.send_items.append(item)
+        self.send_item_by_path[path] = item
+        self._request_thumb(path)
+
+    def _select_send_item(self, path: str):
+        self.send_current_path = path
+        for it in self.send_items:
+            sel = it["path"] == path
+            it["row"].configure(fg_color=SEL if sel else "transparent")
+            it["name"].configure(text_color=TXT if sel else MUTED)
+        self._render_send_preview(self.send_item_by_path.get(path))
+
+    def _refresh_send_queue(self):
+        """Rescan the chosen send folder and rebuild the queue list to match."""
+        for it in self.send_items:
+            it["row"].destroy()
+        self.send_items.clear()
+        self.send_item_by_path.clear()
+        self.send_current_path = None
+        self._render_send_preview(None)
+
+        folder = self.send_dir_var.get().strip()
+        paths = [str(p) for p in collect_images([folder], log=lambda _: None)] if folder else []
+        for p in paths:
+            self._add_send_item(p)
+        self.send_queue_count.configure(text=str(len(self.send_items)))
+
     # -- thumbnails (generated off the UI thread) ----------------------------
 
     def _request_thumb(self, path: str):
@@ -834,6 +886,13 @@ class App(ctk.CTk):
             self.after_cancel(self._resize_after)
         self._resize_after = self.after(
             60, lambda: self._render_preview(self.item_by_path.get(self.current_path)))
+
+    def _on_send_canvas_resize(self, _event=None):
+        if self._send_resize_after:
+            self.after_cancel(self._send_resize_after)
+        self._send_resize_after = self.after(
+            60, lambda: self._render_send_preview(
+                self.send_item_by_path.get(self.send_current_path)))
 
     def _get_preview_image(self, path: str):
         cached = self._preview_cache.get(path)
@@ -953,9 +1012,9 @@ class App(ctk.CTk):
             self._otext(ox + dw / 2, oy + 14, "click to move target",
                         DIM, ("Courier New", 9), anchor="center")
 
-    def _otext(self, x, y, text, fill, font, anchor="w"):
+    def _otext(self, x, y, text, fill, font, anchor="w", canvas=None):
         """Draw text with a 1px black halo so it stays legible over photos."""
-        c = self.canvas
+        c = canvas if canvas is not None else self.canvas
         for dx, dy in ((-1, -1), (-1, 1), (1, -1), (1, 1), (0, -1), (0, 1), (-1, 0), (1, 0)):
             c.create_text(x + dx, y + dy, anchor=anchor, fill="#000000",
                           font=font, text=text)
@@ -1009,8 +1068,8 @@ class App(ctk.CTk):
         elif result.status == "dry_run":
             self._log(f"Target moved to ({fx:.0f}%, {fy:.0f}%) — dry run, no file written")
 
-    def _draw_placeholder(self, w, h, text):
-        c = self.canvas
+    def _draw_placeholder(self, w, h, text, canvas=None):
+        c = canvas if canvas is not None else self.canvas
         bw = min(w - 80, (h - 80) * 16 / 9)
         bw = max(120, bw)
         bh = bw * 9 / 16
@@ -1024,6 +1083,61 @@ class App(ctk.CTk):
                           fill=STROKE, width=1)
         c.create_text(w / 2, y1 + bh + 28, fill=MUTED, font=("Courier New", 12),
                       text=text, justify="center", width=w - 80)
+
+    def _render_send_preview(self, item):
+        """Simpler sibling of _render_preview for the Send queue — just the
+        photo, filename, and a status banner; no crop box or focal point."""
+        c = self.send_canvas
+        w, h = c.winfo_width(), c.winfo_height()
+        if w < 20 or h < 20:
+            return
+        c.delete("all")
+
+        if not item:
+            self._draw_placeholder(w, h, "Select a folder to preview photos to send",
+                                   canvas=c)
+            return
+
+        path = item["path"]
+        try:
+            pil, (ow, oh) = self._get_preview_image(path)
+        except Exception as exc:
+            self._draw_placeholder(w, h, f"Could not open image\n{exc}", canvas=c)
+            return
+
+        m = 12
+        scale = min((w - 2 * m) / ow, (h - 2 * m) / oh)
+        dw, dh = max(1, round(ow * scale)), max(1, round(oh * scale))
+        ox, oy = (w - dw) / 2, (h - dh) / 2
+
+        disp = pil.resize((dw, dh), Image.LANCZOS)
+        self._tk_send_preview = ImageTk.PhotoImage(disp)
+        c.create_image(ox, oy, anchor="nw", image=self._tk_send_preview)
+
+        status = item.get("status")
+        if status == "sending":
+            c.create_rectangle(ox + 10, oy + 10, ox + 124, oy + 36,
+                               fill=PANEL, outline=ACCENT, width=1)
+            c.create_text(ox + 20, oy + 23, anchor="w", fill=ACCENT,
+                          font=("Courier New", 11, "bold"), text="SENDING…")
+        elif status == "sent":
+            c.create_rectangle(ox + 10, oy + 10, ox + 96, oy + 36,
+                               fill=PANEL, outline=DONE, width=1)
+            c.create_text(ox + 20, oy + 23, anchor="w", fill=DONE,
+                          font=("Courier New", 11, "bold"), text="SENT")
+        elif status == "failed":
+            result = item.get("result")
+            err = (result.error if result else "") or "could not send"
+            c.create_rectangle(ox, oy, ox + dw, oy + dh, fill=BG, outline="",
+                               stipple="gray50")
+            c.create_text(ox + dw / 2, oy + dh / 2, fill=ERRC,
+                          font=("Courier New", 12, "bold"),
+                          text=f"FAILED\n{err}", justify="center", width=dw - 40)
+
+        self._otext(ox + 8, oy + dh - 12, Path(path).name,
+                    "#ffffff", ("Courier New", 11), anchor="w", canvas=c)
+        self._otext(ox + dw - 8, oy + dh - 12, f"{ow} × {oh}",
+                    "#cfd2e0", ("Courier New", 10), anchor="e", canvas=c)
 
     # =======================================================================
     # Rate tab — cheap AI ratings/feedback, fully separate from cropping.
@@ -1551,10 +1665,27 @@ class App(ctk.CTk):
     # =======================================================================
 
     def _build_send_tab(self, tab):
-        body = ctk.CTkScrollableFrame(tab, fg_color="transparent")
-        body.pack(fill="both", expand=True)
+        tab.grid_rowconfigure(0, weight=1)
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_columnconfigure(1, weight=0)
 
-        c = self._card(body, "Photos to send")
+        # --- left: preview + settings + send button -------------------------
+        left = ctk.CTkFrame(tab, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
+        left.grid_rowconfigure(0, weight=1)
+        left.grid_columnconfigure(0, weight=1)
+
+        pv = ctk.CTkFrame(left, fg_color="#0a0b12", corner_radius=10,
+                          border_width=1, border_color=STROKE)
+        pv.grid(row=0, column=0, sticky="nsew")
+        self.send_canvas = tk.Canvas(pv, bg="#0a0b12", highlightthickness=0, bd=0)
+        self.send_canvas.pack(fill="both", expand=True, padx=8, pady=8)
+        self.send_canvas.bind("<Configure>", self._on_send_canvas_resize)
+
+        settings_frame = ctk.CTkFrame(left, fg_color="transparent")
+        settings_frame.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+
+        c = self._card(settings_frame, "Photos to send")
         ctk.CTkLabel(c, text="Folder", font=self.f_label, text_color=MUTED,
                      anchor="w").grid(row=0, column=0, sticky="w", pady=7)
         ff = ctk.CTkFrame(c, fg_color="transparent")
@@ -1565,7 +1696,7 @@ class App(ctk.CTk):
                     "Select a folder of photos to email").grid(row=0, column=0, sticky="ew", padx=(0, 8))
         self._ghost(ff, "Browse", self._browse_send_dir, width=84).grid(row=0, column=1)
 
-        d = self._card(body, "Delivery")
+        d = self._card(settings_frame, "Delivery")
         ctk.CTkLabel(d, text="To", font=self.f_label, text_color=MUTED,
                      anchor="w").grid(row=0, column=0, sticky="w", pady=7)
         self.send_to_var = ctk.StringVar(value=self.settings.get("to_email", DEFAULT_TO))
@@ -1581,8 +1712,33 @@ class App(ctk.CTk):
                      font=self.f_small, text_color=DIM, anchor="w").grid(
             row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
-        self.send_btn = self._primary(body, "Send Photos", self._run_send, height=46)
-        self.send_btn.pack(fill="x", pady=(2, 8))
+        self.send_btn = self._primary(left, "Send Photos", self._run_send, height=46)
+        self.send_btn.grid(row=2, column=0, sticky="ew", pady=(0, 0))
+
+        # --- right: queue panel, mirrors the crop tab's live queue ----------
+        right = ctk.CTkFrame(tab, fg_color=PANEL, corner_radius=10, width=360,
+                             border_width=1, border_color=STROKE)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.grid_propagate(False)
+
+        hdr = ctk.CTkFrame(right, fg_color="transparent")
+        hdr.pack(fill="x", padx=16, pady=(16, 6))
+        hdr.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(hdr, text="QUEUE", font=self.f_section, text_color=MUTED).grid(
+            row=0, column=0, sticky="w")
+        self.send_queue_count = ctk.CTkLabel(hdr, text="0", font=self.f_button,
+                                             text_color=ACCENT)
+        self.send_queue_count.grid(row=0, column=1, sticky="e")
+
+        btns = ctk.CTkFrame(right, fg_color="transparent")
+        btns.pack(fill="x", padx=16, pady=(0, 8))
+        self._ghost(btns, "Refresh", self._refresh_send_queue, width=84).pack(side="left")
+
+        self.send_queue_list = ctk.CTkScrollableFrame(right, fg_color="transparent")
+        self.send_queue_list.pack(fill="both", expand=True, padx=8, pady=(0, 10))
+
+        if self.send_dir_var.get().strip():
+            self._refresh_send_queue()
 
     # =======================================================================
     # Settings tab
@@ -1697,6 +1853,7 @@ class App(ctk.CTk):
         if folder:
             self.send_dir_var.set(folder)
             self._persist_paths()
+            self._refresh_send_queue()
 
     # =======================================================================
     # Settings persistence
@@ -1787,6 +1944,9 @@ class App(ctk.CTk):
     def _post_result(self, result):
         self.result_queue.put(result)
 
+    def _post_send_result(self, result):
+        self.send_result_queue.put(result)
+
     def _clear_log(self):
         self.log_box.configure(state="normal")
         self.log_box.delete("1.0", "end")
@@ -1836,6 +1996,13 @@ class App(ctk.CTk):
         except queue.Empty:
             pass
 
+        # send results
+        try:
+            while True:
+                self._apply_send_result(self.send_result_queue.get_nowait())
+        except queue.Empty:
+            pass
+
         # rate results — batched into one gallery re-render per poll tick
         try:
             while True:
@@ -1854,8 +2021,10 @@ class App(ctk.CTk):
         try:
             for _ in range(self._THUMB_APPLY_PER_TICK):
                 path, pil = self.thumb_ready.get_nowait()
-                item = self.item_by_path.get(path)
-                if item:
+                items = [it for it in
+                         (self.item_by_path.get(path), self.send_item_by_path.get(path))
+                         if it]
+                for item in items:
                     try:
                         img = ctk.CTkImage(light_image=pil, dark_image=pil, size=THUMB_SIZE)
                         item["thumb_img"] = img
@@ -1880,7 +2049,7 @@ class App(ctk.CTk):
         item["status"] = result.status
         if result.status == "analyzing":
             item["status"] = "now"
-            self._update_row(item)
+            self._update_row(item, self.current_path)
             # If the current photo already has a crop result, linger on it
             # briefly so the user can see the focal point before we move on.
             current = self.item_by_path.get(self.current_path) if self.current_path else None
@@ -1891,9 +2060,31 @@ class App(ctk.CTk):
                 self._select_item(result.path)
         else:
             item["result"] = result
-            self._update_row(item)
+            self._update_row(item, self.current_path)
             if result.path == self.current_path:
                 self._render_preview(item)
+
+    # How long to linger on a "sent" photo before jumping to the next one
+    # being sent, so the send queue reads like the crop queue (ms).
+    _SEND_LINGER_MS = 900
+
+    def _apply_send_result(self, result):
+        item = self.send_item_by_path.get(str(Path(result.path)))
+        if not item:
+            return
+        item["status"] = result.status
+        item["result"] = result
+        self._update_row(item, self.send_current_path)
+        if result.status == "sending":
+            current = self.send_item_by_path.get(self.send_current_path) \
+                if self.send_current_path else None
+            if current and current.get("status") in ("sent", "failed"):
+                self.after(self._SEND_LINGER_MS,
+                           lambda p=result.path: self._select_send_item(p))
+            else:
+                self._select_send_item(result.path)
+        elif result.path == self.send_current_path:
+            self._render_send_preview(item)
 
     def _apply_rate_result(self, result: RatingResult):
         self.rate_results[result.path] = result
@@ -1974,7 +2165,7 @@ class App(ctk.CTk):
         for it in self.items:
             it["status"] = "queued"
             it["result"] = None
-            self._update_row(it)
+            self._update_row(it, self.current_path)
 
         self.progress.set(0)
         self.progress_count.configure(text=f"0 / {len(files)}")
@@ -2072,6 +2263,14 @@ class App(ctk.CTk):
             self._select_tab("Settings")
             return
 
+        # Make sure the visual queue matches what's actually on disk, then
+        # reset it for a fresh run (results will repopulate live).
+        self._refresh_send_queue()
+        for it in self.send_items:
+            it["status"] = "queued"
+            it["result"] = None
+            self._update_row(it, self.send_current_path)
+
         self.progress.set(0)
         self.progress_count.configure(text="")
         self._set_busy(True, "Sending…", op_btn=self.send_btn,
@@ -2084,7 +2283,7 @@ class App(ctk.CTk):
                     directory=send_dir, from_addr=from_addr, to_addr=to_addr,
                     smtp_host=smtp_host, smtp_port=smtp_port, password=password,
                     log_fn=self._log, max_retries=max_retries, retry_delay=retry_delay,
-                    progress_fn=self._post_progress,
+                    progress_fn=self._post_progress, result_fn=self._post_send_result,
                 )
                 self._summarize(failures, total, "sent")
             except Exception as exc:

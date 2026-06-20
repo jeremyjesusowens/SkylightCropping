@@ -578,6 +578,7 @@ def run_send(
     max_retries: int = 12,
     retry_delay: int = 300,
     progress_fn: ProgressFn = _noop_progress,
+    result_fn: ResultFn = _noop_result,
 ) -> tuple[list[tuple[str, str]], int]:
     """
     Email each photo in directory as an individual attachment.
@@ -604,6 +605,7 @@ def run_send(
 
     for i, img_path in enumerate(images, start=1):
         log_fn(f"\n[{i}/{total}] {img_path.name}")
+        result_fn(CropResult(path=str(img_path), status="sending"))
         try:
             error = _send_one(
                 img_path, from_addr, to_addr, smtp_host, smtp_port,
@@ -612,6 +614,9 @@ def run_send(
             if error:
                 log_fn(f"  ✗ Gave up after {max_retries} attempt(s): {error}")
                 failures.append((img_path.name, error))
+                result_fn(CropResult(path=str(img_path), status="failed", error=error))
+            else:
+                result_fn(CropResult(path=str(img_path), status="sent"))
 
         except smtplib.SMTPAuthenticationError:
             log_fn(
@@ -619,7 +624,10 @@ def run_send(
                 "For Yahoo Mail, use an App Password, not your account password.\n"
                 "Generate one at: myaccount.yahoo.com → Security → App passwords"
             )
-            failures.extend((img.name, "Authentication failed") for img in images[i - 1:])
+            for img in images[i - 1:]:
+                failures.append((img.name, "Authentication failed"))
+                result_fn(CropResult(path=str(img), status="failed",
+                                      error="Authentication failed"))
             break
         progress_fn(i, total)
 

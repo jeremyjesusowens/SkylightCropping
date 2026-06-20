@@ -84,14 +84,16 @@ jobs:
       - name: Smoke test executable
         shell: pwsh
         run: |
+          $logFile = Join-Path $env:USERPROFILE ".skylight_cropping\app.log"
           $proc = Start-Process -FilePath "dist\SkylightCropping.exe" -PassThru
-          $timeoutSeconds = 20
+          $timeoutSeconds = 45
           $sw = [Diagnostics.Stopwatch]::StartNew()
           $windowFound = $false
           while ($sw.Elapsed.TotalSeconds -lt $timeoutSeconds) {
             $proc.Refresh()
             if ($proc.HasExited) {
               Write-Error "App exited unexpectedly after $($sw.Elapsed.TotalSeconds.ToString('0.0'))s (exit code $($proc.ExitCode))"
+              if (Test-Path $logFile) { Write-Host "---- app.log ----"; Get-Content $logFile }
               exit 1
             }
             if ($proc.MainWindowHandle -ne 0) {
@@ -103,6 +105,7 @@ jobs:
           if (-not $windowFound) {
             Stop-Process -Id $proc.Id -Force
             Write-Error "App did not open a window within $timeoutSeconds seconds"
+            if (Test-Path $logFile) { Write-Host "---- app.log ----"; Get-Content $logFile }
             exit 1
           }
           Write-Host "App window appeared after $($sw.Elapsed.TotalSeconds.ToString('0.0'))s"

@@ -349,6 +349,10 @@ class App(ctk.CTk):
 
         # Rate tab state — separate from the crop queue above by design.
         self.rate_paths: list[str] = []
+        # Mirrors rate_paths for O(1) membership checks — adding a large
+        # batch (hundreds/thousands of files) used to do an O(n) `in` scan
+        # of the list per file, which is O(n^2) overall and froze the UI.
+        self._rate_path_set: set[str] = set()
         self._rate_gallery_hydrated = False
         self.rate_results: dict[str, RatingResult] = {}
         self._rate_dirty = False
@@ -1263,8 +1267,9 @@ class App(ctk.CTk):
         added = False
         for f in paths:
             f = str(Path(f))
-            if f not in self.rate_paths:
+            if f not in self._rate_path_set:
                 self.rate_paths.append(f)
+                self._rate_path_set.add(f)
                 added = True
         if added:
             self._refresh_rate_count()
@@ -1273,6 +1278,7 @@ class App(ctk.CTk):
 
     def _clear_rate_files(self):
         self.rate_paths.clear()
+        self._rate_path_set.clear()
         self.rate_results.clear()
         self._rate_animated.clear()
         self._refresh_rate_count()
@@ -1298,8 +1304,9 @@ class App(ctk.CTk):
         self._rate_gallery_hydrated = True
         for f in self.settings.get("rate_files", []):
             f = str(Path(f))
-            if Path(f).exists() and f not in self.rate_paths:
+            if Path(f).exists() and f not in self._rate_path_set:
                 self.rate_paths.append(f)
+                self._rate_path_set.add(f)
         # Drop dead entries permanently so the remembered list can't grow
         # forever — moved/deleted files no longer come back from disk.
         self._persist_paths()

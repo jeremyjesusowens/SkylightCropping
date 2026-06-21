@@ -22,6 +22,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -95,6 +96,7 @@ class RatingResult:
     tip: Optional[str] = None
     error: Optional[str] = None
     cached: bool = False  # True when served from the local cache (no API call)
+    rated_at: Optional[str] = None  # ISO timestamp; absent for pre-existing cache entries
 
 
 ResultFn = Callable[[RatingResult], None]
@@ -155,8 +157,26 @@ def _cache_entry_to_result(path: str, entry: dict) -> RatingResult:
         path=path, status="rated", score=entry["score"], headline=entry["headline"],
         feedback=entry["feedback"], tags=list(entry.get("tags", [])),
         summary=entry.get("summary"), categories=list(entry.get("categories", [])),
-        tip=entry.get("tip"), cached=True,
+        tip=entry.get("tip"), cached=True, rated_at=entry.get("rated_at"),
     )
+
+
+def list_rating_history() -> list[RatingResult]:
+    """Every photo ever rated, independent of any active queue.
+
+    Reads directly from the on-disk cache, so it survives the queue being
+    cleared and persists across sessions. Sorted most-recently-rated first;
+    entries from before rated_at existed sort last (treated as oldest).
+    """
+    cache = load_cache()
+    results = []
+    for key, entry in cache.items():
+        # Key is "path|size|mtime|model" — split from the right since a
+        # path could itself contain "|".
+        path = key.rsplit("|", 3)[0]
+        results.append(_cache_entry_to_result(path, entry))
+    results.sort(key=lambda r: r.rated_at or "", reverse=True)
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +303,7 @@ def run_rate(
             failures.append((img_path.name, str(exc)))
             result_fn(RatingResult(path=str(img_path), status="failed", error=str(exc)))
         else:
+            data["rated_at"] = datetime.now(timezone.utc).isoformat()
             cache[key] = data
             save_cache(cache)
             log_fn(f"[{i}/{total}] {img_path.name} — {data['score']}/100 \"{data['headline']}\"")
@@ -290,6 +311,7 @@ def run_rate(
                 path=str(img_path), status="rated", score=data["score"],
                 headline=data["headline"], feedback=data["feedback"], tags=data["tags"],
                 summary=data["summary"], categories=data["categories"], tip=data["tip"],
+                rated_at=data["rated_at"],
             ))
         progress_fn(i, total)
 

@@ -117,7 +117,8 @@ from smart_crop import (FALLBACK_MODELS, CropResult, collect_images,
                         compute_crop_box, list_models, recrop_image, run_crop,
                         run_send)
 from rate_photos import (RATE_MODELS, DEFAULT_RATE_MODEL, RatingResult,
-                         clear_cache as clear_rating_cache, run_rate, score_tier)
+                         clear_cache as clear_rating_cache, list_rating_history,
+                         run_rate, score_tier)
 
 # ---------------------------------------------------------------------------
 # Settings persistence
@@ -368,6 +369,26 @@ class App(ctk.CTk):
         self._rate_card_keys: dict[str, tuple] = {}
         self._rate_gallery_placeholder = None
         self._pulse_on = False
+        # How many of the filtered/sorted results are actually mounted as
+        # live Tk widgets. Every mounted card has sticky="ew", so customtkinter
+        # redraws its rounded-corner background on every window resize —
+        # with a queue in the thousands, mounting everything makes resizing
+        # (e.g. maximizing) noticeably slow even outside the Rate tab. Start
+        # small and grow as the user scrolls toward the bottom.
+        self._RATE_GALLERY_PAGE = 200
+        self._rate_visible_count = self._RATE_GALLERY_PAGE
+        self._rate_shown_count = 0
+
+        # History tab state — every photo ever rated, read from the on-disk
+        # cache directly (see list_rating_history), independent of whatever
+        # is currently in the Rate queue. Loaded lazily on first visit.
+        self._history_loaded = False
+        self._history_results: list[RatingResult] = []
+        self._history_cards: dict[str, ctk.CTkBaseClass] = {}
+        self._history_card_keys: dict[str, tuple] = {}
+        self._history_visible_count = self._RATE_GALLERY_PAGE
+        self._history_gallery_placeholder = None
+        self._history_render_token = 0
 
         # Fonts — humanist sans; Courier New / Menlo for mono.
         # Trebuchet MS ships with Windows; Helvetica Neue is the macOS fallback.
@@ -428,6 +449,7 @@ class App(ctk.CTk):
         self.frames = {
             "Crop": ctk.CTkFrame(self.content, fg_color=BG),
             "Rate": ctk.CTkFrame(self.content, fg_color=BG),
+            "History": ctk.CTkFrame(self.content, fg_color=BG),
             "Send": ctk.CTkFrame(self.content, fg_color=BG),
             "Settings": ctk.CTkFrame(self.content, fg_color=BG),
         }
@@ -436,6 +458,7 @@ class App(ctk.CTk):
 
         self._build_crop_tab(self.frames["Crop"])
         self._build_rate_tab(self.frames["Rate"])
+        self._build_history_tab(self.frames["History"])
         self._build_send_tab(self.frames["Send"])
         self._build_settings_tab(self.frames["Settings"])
 
@@ -466,15 +489,16 @@ class App(ctk.CTk):
         self.nav_btns: dict[str, ctk.CTkButton] = {}
         self.nav_bars: dict[str, ctk.CTkFrame] = {}
         self.nav_bar_x: dict[str, int] = {}
-        x0 = 510 if sys.platform == "darwin" else 440
-        for i, name in enumerate(("Crop", "Rate", "Send", "Settings")):
+        x0 = 470 if sys.platform == "darwin" else 410
+        nav_spacing = 100
+        for i, name in enumerate(("Crop", "Rate", "History", "Send", "Settings")):
             b = ctk.CTkButton(bar, text=name.upper(), font=self.f_nav, width=92,
                               fg_color="transparent", hover_color=HOVER,
                               text_color=MUTED,
                               command=lambda n=name: self._select_tab(n))
-            b.place(x=x0 + i * 116, y=14)
+            b.place(x=x0 + i * nav_spacing, y=14)
             u = ctk.CTkFrame(bar, height=3, width=52, fg_color=ACCENT, corner_radius=2)
-            self.nav_bar_x[name] = x0 + i * 116 + 20
+            self.nav_bar_x[name] = x0 + i * nav_spacing + 20
             self.nav_btns[name] = b
             self.nav_bars[name] = u
 
@@ -576,6 +600,8 @@ class App(ctk.CTk):
     def _select_tab(self, name: str):
         if name == "Rate" and not self._rate_gallery_hydrated:
             self._hydrate_rate_gallery()
+        if name == "History" and not self._history_loaded:
+            self._load_rate_history()
         self.frames[name].tkraise()
         for n, b in self.nav_btns.items():
             active = n == name
@@ -1222,6 +1248,26 @@ class App(ctk.CTk):
         self.rate_gallery = ctk.CTkScrollableFrame(tab, fg_color="transparent")
         self.rate_gallery.grid(row=1, column=0, sticky="nsew")
         self.rate_gallery.grid_columnconfigure(0, weight=1)
+        # Grow the mounted-card window as the user scrolls near the bottom.
+        # Best-effort: if customtkinter's internal canvas isn't where we
+        # expect it, this just silently no-ops and the gallery still works
+        # (it only loses the auto-grow-on-scroll convenience).
+        canvas = getattr(self.rate_gallery, "_parent_canvas", None)
+        if canvas is not None:
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                canvas.bind(seq, self._on_rate_gallery_scroll, add="+")
+
+    def _on_rate_gallery_scroll(self, _event=None):
+        canvas = getattr(self.rate_gallery, "_parent_canvas", None)
+        if canvas is None:
+            return
+        try:
+            _top, bottom = canvas.yview()
+        except Exception:
+            return
+        if bottom > 0.85 and self._rate_visible_count < getattr(self, "_rate_shown_count", 0):
+            self._rate_visible_count += self._RATE_GALLERY_PAGE
+            self._render_rate_gallery()
 
     def _set_rate_filter(self, key: str):
         self.rate_filter_var.set(key)
@@ -1300,25 +1346,61 @@ class App(ctk.CTk):
         every remembered file on every launch, which could number in the
         thousands after a folder import and made the whole app appear to
         hang before the window even showed up.
+
+        Even deferred, checking existence of thousands of remembered files
+        in one synchronous loop is enough to make the app look frozen the
+        moment the tab opens — so this still runs in chunks via `after`,
+        same as gallery card rendering.
         """
         self._rate_gallery_hydrated = True
-        for f in self.settings.get("rate_files", []):
-            f = str(Path(f))
+        remembered = list(self.settings.get("rate_files", []))
+        if not remembered:
+            self._refresh_rate_count()
+            self._render_rate_gallery()
+            return
+        self._show_rate_loading(0, len(remembered))
+        self._hydrate_rate_chunk(remembered, 0)
+
+    _RATE_HYDRATE_CHUNK = 300
+
+    def _hydrate_rate_chunk(self, remembered, start):
+        end = min(start + self._RATE_HYDRATE_CHUNK, len(remembered))
+        for i in range(start, end):
+            f = str(Path(remembered[i]))
             if Path(f).exists() and f not in self._rate_path_set:
                 self.rate_paths.append(f)
                 self._rate_path_set.add(f)
+        if end < len(remembered):
+            self._show_rate_loading(end, len(remembered))
+            self.after(1, lambda: self._hydrate_rate_chunk(remembered, end))
+            return
         # Drop dead entries permanently so the remembered list can't grow
         # forever — moved/deleted files no longer come back from disk.
         self._persist_paths()
         self._refresh_rate_count()
         self._render_rate_gallery()
 
+    def _show_rate_loading(self, done: int, total: int):
+        if self._rate_gallery_placeholder is None:
+            for w in self.rate_gallery.winfo_children():
+                w.destroy()
+            self._rate_cards.clear()
+            self._rate_card_keys.clear()
+            self._rate_gallery_placeholder = ctk.CTkLabel(
+                self.rate_gallery, font=self.f_label, text_color=DIM, justify="center")
+            self._rate_gallery_placeholder.grid(row=0, column=0, pady=60)
+        self._rate_gallery_placeholder.configure(
+            text=f"Loading queue — checking {done}/{total} photos…")
+
     def _clear_ratings_cache(self):
         if messagebox.askyesno("Clear Ratings Cache",
-                               "This removes every cached rating from disk. "
-                               "Re-rating those photos later will call the API again. Continue?"):
+                               "This removes every cached rating from disk, including your "
+                               "History tab. Re-rating those photos later will call the API "
+                               "again. Continue?"):
             clear_rating_cache()
             self._log("Ratings cache cleared.")
+            if self._history_loaded:
+                self._load_rate_history()
 
     # -- gallery rendering -------------------------------------------------
 
@@ -1386,6 +1468,7 @@ class App(ctk.CTk):
                                         or score_tier(result.score) != filter_key):
                 continue
             shown.append(path)
+        self._rate_shown_count = len(shown)
 
         if self._rate_gallery_placeholder is not None:
             self._rate_gallery_placeholder.destroy()
@@ -1403,9 +1486,16 @@ class App(ctk.CTk):
             self._rate_gallery_placeholder.grid(row=0, column=0, pady=40)
             return
 
-        shown_set = set(shown)
+        # Only mount a bounded window of the filtered/sorted list as live
+        # widgets (see _rate_visible_count) — mounting all of a large queue
+        # at once is itself the slow part, and keeping them all mounted is
+        # what makes later window resizes slow too. Cards beyond the window
+        # are torn down rather than left to accumulate as the user scrolls.
+        visible_count = min(self._rate_visible_count, len(shown))
+        visible = shown[:visible_count]
+        visible_set = set(visible)
         for path in list(self._rate_cards):
-            if path not in shown_set:
+            if path not in visible_set:
                 self._rate_cards.pop(path).destroy()
                 self._rate_card_keys.pop(path, None)
 
@@ -1419,7 +1509,7 @@ class App(ctk.CTk):
         # _render_rate_gallery() call (e.g. the user changed the filter)
         # has already started its own batches.
         self._rate_render_token = getattr(self, "_rate_render_token", 0) + 1
-        self._render_rate_gallery_chunk(shown, top_path, top_score, 0, self._rate_render_token)
+        self._render_rate_gallery_chunk(visible, top_path, top_score, 0, self._rate_render_token)
 
     _RATE_RENDER_CHUNK = 40
 
@@ -1447,10 +1537,11 @@ class App(ctk.CTk):
             self.after(1, lambda: self._render_rate_gallery_chunk(
                 shown, top_path, top_score, end, token))
 
-    def _build_rate_card(self, path: str, result, is_top: bool, row: int):
+    def _build_rate_card(self, path: str, result, is_top: bool, row: int, gallery=None):
+        gallery = gallery if gallery is not None else self.rate_gallery
         name = Path(path).name
         if result is None:
-            card = ctk.CTkFrame(self.rate_gallery, corner_radius=10, fg_color=PANEL,
+            card = ctk.CTkFrame(gallery, corner_radius=10, fg_color=PANEL,
                                 border_width=1, border_color=STROKE)
             card.grid(row=row, column=0, sticky="ew", pady=5, padx=2)
             ctk.CTkLabel(card, text=f"●  {name}", font=self.f_mono, text_color=DIM,
@@ -1460,7 +1551,7 @@ class App(ctk.CTk):
             return card
 
         if result.status == "analyzing":
-            card = ctk.CTkFrame(self.rate_gallery, corner_radius=10, fg_color=PANEL,
+            card = ctk.CTkFrame(gallery, corner_radius=10, fg_color=PANEL,
                                 border_width=1, border_color=ACCENT)
             card.grid(row=row, column=0, sticky="ew", pady=5, padx=2)
             ctk.CTkLabel(card, text=f"⠿  {name}", font=self.f_mono, text_color=TXT,
@@ -1470,7 +1561,7 @@ class App(ctk.CTk):
             return card
 
         if result.status == "failed":
-            card = ctk.CTkFrame(self.rate_gallery, corner_radius=10, fg_color=PANEL,
+            card = ctk.CTkFrame(gallery, corner_radius=10, fg_color=PANEL,
                                 border_width=1, border_color=ERRC)
             card.grid(row=row, column=0, sticky="ew", pady=5, padx=2)
             ctk.CTkLabel(card, text=f"✗  {name}", font=self.f_mono, text_color=ERRC,
@@ -1483,7 +1574,7 @@ class App(ctk.CTk):
         tier = score_tier(result.score)
         color = TIER_COLORS[tier]
         border_w = 3 if is_top else 2
-        card = ctk.CTkFrame(self.rate_gallery, corner_radius=16, fg_color=PANEL,
+        card = ctk.CTkFrame(gallery, corner_radius=16, fg_color=PANEL,
                             border_width=border_w, border_color=color)
         card.grid(row=row, column=0, sticky="ew", pady=8, padx=2)
         card.grid_columnconfigure(1, weight=1)
@@ -1527,7 +1618,7 @@ class App(ctk.CTk):
                             font=self.f_small, text_color=cat_color).pack(
                     side="left", padx=(0, 12))
 
-        self._ghost(info, "Full Review →", lambda p=path: self._open_rate_detail(p),
+        self._ghost(info, "Full Review →", lambda p=path, r=result: self._open_rate_detail(p, r),
                    width=140, height=26).grid(row=4, column=0, sticky="w", pady=(8, 0))
 
         ring = tk.Canvas(card, width=72, height=72, bg=PANEL, highlightthickness=0)
@@ -1566,8 +1657,9 @@ class App(ctk.CTk):
         if frame < steps:
             self.after(25, lambda: self._animate_score_ring(canvas, target, color, frame + 1))
 
-    def _open_rate_detail(self, path: str):
-        result = self.rate_results.get(path)
+    def _open_rate_detail(self, path: str, result=None):
+        if result is None:
+            result = self.rate_results.get(path)
         if not result or result.status != "rated":
             return
         tier = score_tier(result.score)
@@ -1666,6 +1758,101 @@ class App(ctk.CTk):
         except Exception:
             pass
         self.after(550, self._pulse_tick)
+
+    # =======================================================================
+    # History tab — every photo ever rated, read straight from the on-disk
+    # cache so it survives the Rate queue being cleared and persists across
+    # sessions. Read-only browse; re-add a photo to the Rate queue to
+    # re-rate it (free if unchanged, since it'll just hit the same cache).
+    # =======================================================================
+
+    def _build_history_tab(self, tab):
+        tab.grid_rowconfigure(1, weight=1)
+        tab.grid_columnconfigure(0, weight=1)
+
+        head = ctk.CTkFrame(tab, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ctk.CTkLabel(head, text="Every photo you've ever rated, regardless of what's "
+                                "currently in the Rate queue.", font=self.f_label,
+                    text_color=MUTED, anchor="w").pack(side="left")
+        self._ghost(head, "Refresh", self._load_rate_history, width=90).pack(side="right")
+        self.history_count_label = ctk.CTkLabel(head, text="", font=self.f_label,
+                                                 text_color=MUTED)
+        self.history_count_label.pack(side="right", padx=(0, 12))
+
+        self.history_gallery = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        self.history_gallery.grid(row=1, column=0, sticky="nsew")
+        self.history_gallery.grid_columnconfigure(0, weight=1)
+        canvas = getattr(self.history_gallery, "_parent_canvas", None)
+        if canvas is not None:
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                canvas.bind(seq, self._on_history_scroll, add="+")
+
+    def _load_rate_history(self):
+        self._history_loaded = True
+        self._history_results = list_rating_history()
+        self._history_visible_count = self._RATE_GALLERY_PAGE
+        self.history_count_label.configure(text=f"{len(self._history_results)} rated")
+        self._render_history_gallery()
+
+    def _on_history_scroll(self, _event=None):
+        canvas = getattr(self.history_gallery, "_parent_canvas", None)
+        if canvas is None:
+            return
+        try:
+            _top, bottom = canvas.yview()
+        except Exception:
+            return
+        if bottom > 0.85 and self._history_visible_count < len(self._history_results):
+            self._history_visible_count += self._RATE_GALLERY_PAGE
+            self._render_history_gallery()
+
+    def _render_history_gallery(self):
+        if not self._history_results:
+            for w in self.history_gallery.winfo_children():
+                w.destroy()
+            self._history_cards.clear()
+            self._history_card_keys.clear()
+            self._history_gallery_placeholder = ctk.CTkLabel(
+                self.history_gallery, text="No rated photos yet — rate some in the Rate tab.",
+                font=self.f_label, text_color=DIM, justify="center")
+            self._history_gallery_placeholder.grid(row=0, column=0, pady=60)
+            return
+
+        if self._history_gallery_placeholder is not None:
+            self._history_gallery_placeholder.destroy()
+            self._history_gallery_placeholder = None
+
+        visible_count = min(self._history_visible_count, len(self._history_results))
+        visible = self._history_results[:visible_count]
+        visible_paths = {r.path for r in visible}
+        for path in list(self._history_cards):
+            if path not in visible_paths:
+                self._history_cards.pop(path).destroy()
+                self._history_card_keys.pop(path, None)
+
+        self._history_render_token += 1
+        self._render_history_gallery_chunk(visible, 0, self._history_render_token)
+
+    def _render_history_gallery_chunk(self, visible, start, token):
+        if token != self._history_render_token:
+            return
+        end = min(start + self._RATE_RENDER_CHUNK, len(visible))
+        for row in range(start, end):
+            result = visible[row]
+            key = self._rate_card_key(result, False)
+            card = self._history_cards.get(result.path)
+            if card is None or self._history_card_keys.get(result.path) != key:
+                if card is not None:
+                    card.destroy()
+                card = self._build_rate_card(result.path, result, False, row,
+                                             gallery=self.history_gallery)
+                self._history_cards[result.path] = card
+                self._history_card_keys[result.path] = key
+            else:
+                card.grid(row=row, column=0)
+        if end < len(visible):
+            self.after(1, lambda: self._render_history_gallery_chunk(visible, end, token))
 
     # =======================================================================
     # Send tab

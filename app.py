@@ -368,6 +368,15 @@ class App(ctk.CTk):
         self._rate_card_keys: dict[str, tuple] = {}
         self._rate_gallery_placeholder = None
         self._pulse_on = False
+        # How many of the filtered/sorted results are actually mounted as
+        # live Tk widgets. Every mounted card has sticky="ew", so customtkinter
+        # redraws its rounded-corner background on every window resize —
+        # with a queue in the thousands, mounting everything makes resizing
+        # (e.g. maximizing) noticeably slow even outside the Rate tab. Start
+        # small and grow as the user scrolls toward the bottom.
+        self._RATE_GALLERY_PAGE = 200
+        self._rate_visible_count = self._RATE_GALLERY_PAGE
+        self._rate_shown_count = 0
 
         # Fonts — humanist sans; Courier New / Menlo for mono.
         # Trebuchet MS ships with Windows; Helvetica Neue is the macOS fallback.
@@ -1222,6 +1231,26 @@ class App(ctk.CTk):
         self.rate_gallery = ctk.CTkScrollableFrame(tab, fg_color="transparent")
         self.rate_gallery.grid(row=1, column=0, sticky="nsew")
         self.rate_gallery.grid_columnconfigure(0, weight=1)
+        # Grow the mounted-card window as the user scrolls near the bottom.
+        # Best-effort: if customtkinter's internal canvas isn't where we
+        # expect it, this just silently no-ops and the gallery still works
+        # (it only loses the auto-grow-on-scroll convenience).
+        canvas = getattr(self.rate_gallery, "_parent_canvas", None)
+        if canvas is not None:
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                canvas.bind(seq, self._on_rate_gallery_scroll, add="+")
+
+    def _on_rate_gallery_scroll(self, _event=None):
+        canvas = getattr(self.rate_gallery, "_parent_canvas", None)
+        if canvas is None:
+            return
+        try:
+            _top, bottom = canvas.yview()
+        except Exception:
+            return
+        if bottom > 0.85 and self._rate_visible_count < getattr(self, "_rate_shown_count", 0):
+            self._rate_visible_count += self._RATE_GALLERY_PAGE
+            self._render_rate_gallery()
 
     def _set_rate_filter(self, key: str):
         self.rate_filter_var.set(key)
@@ -1300,18 +1329,51 @@ class App(ctk.CTk):
         every remembered file on every launch, which could number in the
         thousands after a folder import and made the whole app appear to
         hang before the window even showed up.
+
+        Even deferred, checking existence of thousands of remembered files
+        in one synchronous loop is enough to make the app look frozen the
+        moment the tab opens — so this still runs in chunks via `after`,
+        same as gallery card rendering.
         """
         self._rate_gallery_hydrated = True
-        for f in self.settings.get("rate_files", []):
-            f = str(Path(f))
+        remembered = list(self.settings.get("rate_files", []))
+        if not remembered:
+            self._refresh_rate_count()
+            self._render_rate_gallery()
+            return
+        self._show_rate_loading(0, len(remembered))
+        self._hydrate_rate_chunk(remembered, 0)
+
+    _RATE_HYDRATE_CHUNK = 300
+
+    def _hydrate_rate_chunk(self, remembered, start):
+        end = min(start + self._RATE_HYDRATE_CHUNK, len(remembered))
+        for i in range(start, end):
+            f = str(Path(remembered[i]))
             if Path(f).exists() and f not in self._rate_path_set:
                 self.rate_paths.append(f)
                 self._rate_path_set.add(f)
+        if end < len(remembered):
+            self._show_rate_loading(end, len(remembered))
+            self.after(1, lambda: self._hydrate_rate_chunk(remembered, end))
+            return
         # Drop dead entries permanently so the remembered list can't grow
         # forever — moved/deleted files no longer come back from disk.
         self._persist_paths()
         self._refresh_rate_count()
         self._render_rate_gallery()
+
+    def _show_rate_loading(self, done: int, total: int):
+        if self._rate_gallery_placeholder is None:
+            for w in self.rate_gallery.winfo_children():
+                w.destroy()
+            self._rate_cards.clear()
+            self._rate_card_keys.clear()
+            self._rate_gallery_placeholder = ctk.CTkLabel(
+                self.rate_gallery, font=self.f_label, text_color=DIM, justify="center")
+            self._rate_gallery_placeholder.grid(row=0, column=0, pady=60)
+        self._rate_gallery_placeholder.configure(
+            text=f"Loading queue — checking {done}/{total} photos…")
 
     def _clear_ratings_cache(self):
         if messagebox.askyesno("Clear Ratings Cache",
@@ -1386,6 +1448,7 @@ class App(ctk.CTk):
                                         or score_tier(result.score) != filter_key):
                 continue
             shown.append(path)
+        self._rate_shown_count = len(shown)
 
         if self._rate_gallery_placeholder is not None:
             self._rate_gallery_placeholder.destroy()
@@ -1403,9 +1466,16 @@ class App(ctk.CTk):
             self._rate_gallery_placeholder.grid(row=0, column=0, pady=40)
             return
 
-        shown_set = set(shown)
+        # Only mount a bounded window of the filtered/sorted list as live
+        # widgets (see _rate_visible_count) — mounting all of a large queue
+        # at once is itself the slow part, and keeping them all mounted is
+        # what makes later window resizes slow too. Cards beyond the window
+        # are torn down rather than left to accumulate as the user scrolls.
+        visible_count = min(self._rate_visible_count, len(shown))
+        visible = shown[:visible_count]
+        visible_set = set(visible)
         for path in list(self._rate_cards):
-            if path not in shown_set:
+            if path not in visible_set:
                 self._rate_cards.pop(path).destroy()
                 self._rate_card_keys.pop(path, None)
 
@@ -1419,7 +1489,7 @@ class App(ctk.CTk):
         # _render_rate_gallery() call (e.g. the user changed the filter)
         # has already started its own batches.
         self._rate_render_token = getattr(self, "_rate_render_token", 0) + 1
-        self._render_rate_gallery_chunk(shown, top_path, top_score, 0, self._rate_render_token)
+        self._render_rate_gallery_chunk(visible, top_path, top_score, 0, self._rate_render_token)
 
     _RATE_RENDER_CHUNK = 40
 

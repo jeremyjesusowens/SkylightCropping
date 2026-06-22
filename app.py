@@ -1670,6 +1670,10 @@ class App(ctk.CTk):
         win.geometry("760x680")
         win.configure(fg_color=BG)
         win.transient(self)
+        # On Windows, CTkToplevel can render behind the main window or fail to
+        # take focus unless explicitly lifted/focused after the window manager
+        # has placed it.
+        win.after(10, lambda: (win.lift(), win.focus_force()))
 
         body = ctk.CTkScrollableFrame(win, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=22, pady=22)
